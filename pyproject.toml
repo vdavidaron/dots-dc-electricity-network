@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ExampleCalculationService"
+version = "0.0.1"
+authors = [
+  { name="Example Author", email="author@example.com" },
+]
+description = "A small example package"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+  'helics==3.6.1',
+  'dots_infrastructure==1.0.9'
+]
+
+[project.urls]
+Homepage = "https://github.com/EES-TUe/Dots-calculation-service-template"
+Issues = "https://github.com/EES-TUe/Dots-calculation-service-template/issues"
