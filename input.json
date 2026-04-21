@@ -1,9 +1,22 @@
 {
     "name": "NetworkBalancerService",
     "esdl_type": "ElectricityNetwork",
-    "description": "Routes datacenter demand to the grid and battery using a peak-shaving strategy.",
+    "description": "Routes datacenter demand to the grid and battery. Central optimization intelligence. Monitors data and creates dispatch plans.",
     "relevant_links": [],
     "calculations": [
+        {
+            "name": "day_ahead_routing",
+            "time_period_in_seconds": 86400,
+            "offset_in_seconds": 0,
+            "description": "Processes DA limits and forecasts, publishes consumption plan.",
+            "inputs": [
+                { "name": "power_limit_plan_DA", "esdl_type": "PowerPlant", "data_type": "STRING", "description": "Grid limits", "unit": "JSON" },
+                { "name": "mandated_min_power_draw_DA", "esdl_type": "PowerPlant", "data_type": "STRING", "description": "Grid mandate", "unit": "JSON" },
+                { "name": "carbon_intensity_plan_DA", "esdl_type": "PowerPlant", "data_type": "STRING", "description": "Grid carbon", "unit": "JSON" },
+                { "name": "planned_generation_DA", "esdl_type": "PVInstallation", "data_type": "STRING", "description": "RES forecast", "unit": "JSON" }
+            ],
+            "outputs": []
+        },
         {
             "name": "network_dispatch",
             "description": "Splits the required power between the Grid and the BESS.",
@@ -16,7 +29,18 @@
                     "data_type": "DOUBLE",
                     "description": "Total power requested by the datacenter",
                     "unit": "W"
-                }
+                },
+                { "name": "actual_power_limit_ID", "esdl_type": "PowerPlant", "data_type": "DOUBLE", "description": "Grid limit", "unit": "W" },
+                { "name": "actual_power_w", "esdl_type": "PowerPlant", "data_type": "DOUBLE", "description": "Grid The actual power supplied (positive) or absorbed (negative)", "unit": "W" },
+                { "name": "actual_carbon_intensity_ID", "esdl_type": "PowerPlant", "data_type": "DOUBLE", "description": "Grid carbon", "unit": "gCO2/kWh" },
+                { "name": "bess_power_w", "esdl_type": "Battery", "data_type": "DOUBLE", "description": "BESS output", "unit": "W" },
+                { "name": "state_of_charge", "esdl_type": "Battery", "data_type": "DOUBLE", "description": "BESS SoC", "unit": "pct" },
+                { "name": "max_available_charge", "esdl_type": "Battery", "data_type": "DOUBLE", "description": "BESS charge limit", "unit": "W" },
+                { "name": "max_available_discharge", "esdl_type": "Battery", "data_type": "DOUBLE", "description": "BESS discharge limit", "unit": "W" },
+                { "name": "potential_available_generation_ID", "esdl_type": "PVInstallation", "data_type": "DOUBLE", "description": "RES potential", "unit": "W" },
+                { "name": "supplied_power_ID", "esdl_type": "PVInstallation", "data_type": "DOUBLE", "description": "RES actual", "unit": "W" },
+                { "name": "Backup_supplied_power", "esdl_type": "GasProducer", "data_type": "DOUBLE", "description": "Backup actual", "unit": "W" },
+                { "name": "available_max_power", "esdl_type": "GasProducer", "data_type": "DOUBLE", "description": "Backup max", "unit": "W" }
             ],
             "outputs": [
                 {
@@ -30,7 +54,9 @@
                     "data_type": "DOUBLE",
                     "description": "Power requested from the grid connection",
                     "unit": "W"
-                }
+                },
+                { "name": "current_max_power_limit", "data_type": "DOUBLE", "description": "Curtailment command for Renewables", "unit": "W" },
+                { "name": "Backup_requested_power", "data_type": "DOUBLE", "description": "Generator dispatch command", "unit": "W" }
             ]
         }
     ]

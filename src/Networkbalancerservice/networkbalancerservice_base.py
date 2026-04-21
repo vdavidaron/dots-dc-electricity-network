@@ -14,12 +14,92 @@ class NetworkbalancerserviceBase(HelicsSimulationExecutor):
         self.esdl_obj_mapping : dict[EsdlId, ElectricityNetwork]= {}
 
         
+        # Calculation: day_ahead_routing
+        self.day_ahead_routing_period_seconds = 86400
+        day_ahead_routing_inputs = [
+        
+            SubscriptionDescription(esdl_type="PowerPlant", 
+                                    input_name="power_limit_plan_DA", 
+                                    input_unit="JSON", 
+                                    input_type=h.HelicsDataType.STRING),
+            SubscriptionDescription(esdl_type="PowerPlant", 
+                                    input_name="mandated_min_power_draw_DA", 
+                                    input_unit="JSON", 
+                                    input_type=h.HelicsDataType.STRING),
+            SubscriptionDescription(esdl_type="PowerPlant", 
+                                    input_name="carbon_intensity_plan_DA", 
+                                    input_unit="JSON", 
+                                    input_type=h.HelicsDataType.STRING),
+            SubscriptionDescription(esdl_type="PVInstallation", 
+                                    input_name="planned_generation_DA", 
+                                    input_unit="JSON", 
+                                    input_type=h.HelicsDataType.STRING),
+        ]
+        day_ahead_routing_outputs = [
+        
+        ]
+        day_ahead_routing_information = HelicsCalculationInformation(
+            time_period_in_seconds=86400,
+            offset=0, 
+            uninterruptible=False, 
+            wait_for_current_time_update=False, 
+            terminate_on_error=True, 
+            calculation_name="day_ahead_routing", 
+            inputs=day_ahead_routing_inputs, 
+            outputs=day_ahead_routing_outputs, 
+            calculation_function=self.day_ahead_routing
+        )
+        self.add_calculation(day_ahead_routing_information)
         # Calculation: network_dispatch
         self.network_dispatch_period_seconds = 900
         network_dispatch_inputs = [
         
             SubscriptionDescription(esdl_type="ElectricityDemand", 
                                     input_name="demand_power_w", 
+                                    input_unit="W", 
+                                    input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="PowerPlant", 
+                                    input_name="actual_power_limit_ID", 
+                                    input_unit="W", 
+                                    input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="PowerPlant", 
+                                    input_name="actual_power_w", 
+                                    input_unit="W", 
+                                    input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="PowerPlant", 
+                                    input_name="actual_carbon_intensity_ID", 
+                                    input_unit="gCO2/kWh", 
+                                    input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="Battery", 
+                                    input_name="bess_power_w", 
+                                    input_unit="W", 
+                                    input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="Battery", 
+                                    input_name="state_of_charge", 
+                                    input_unit="pct", 
+                                    input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="Battery", 
+                                    input_name="max_available_charge", 
+                                    input_unit="W", 
+                                    input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="Battery", 
+                                    input_name="max_available_discharge", 
+                                    input_unit="W", 
+                                    input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="PVInstallation", 
+                                    input_name="potential_available_generation_ID", 
+                                    input_unit="W", 
+                                    input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="PVInstallation", 
+                                    input_name="supplied_power_ID", 
+                                    input_unit="W", 
+                                    input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="GasProducer", 
+                                    input_name="backup_supplied_power", 
+                                    input_unit="W", 
+                                    input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="GasProducer", 
+                                    input_name="available_max_power", 
                                     input_unit="W", 
                                     input_type=h.HelicsDataType.DOUBLE),
         ]
@@ -33,6 +113,16 @@ class NetworkbalancerserviceBase(HelicsSimulationExecutor):
             PublicationDescription(global_flag=True, 
                                     esdl_type="ElectricityNetwork",
                                     output_name="grid_allocation_w",
+                                    output_unit="W", 
+                                    data_type=h.HelicsDataType.DOUBLE),
+            PublicationDescription(global_flag=True, 
+                                    esdl_type="ElectricityNetwork",
+                                    output_name="current_max_power_limit",
+                                    output_unit="W", 
+                                    data_type=h.HelicsDataType.DOUBLE),
+            PublicationDescription(global_flag=True, 
+                                    esdl_type="ElectricityNetwork",
+                                    output_name="backup_requested_power",
                                     output_unit="W", 
                                     data_type=h.HelicsDataType.DOUBLE),
         ]
@@ -55,6 +145,9 @@ class NetworkbalancerserviceBase(HelicsSimulationExecutor):
             if hasattr(esdl_obj, "id"):
                 self.esdl_obj_mapping[esdl_obj.id] = esdl_obj
 
+    
+    def day_ahead_routing(self, param_dict : dict, simulation_time : datetime, time_step_number : TimeStepInformation, esdl_id : EsdlId, energy_system : EnergySystem):
+        pass
     
     def network_dispatch(self, param_dict : dict, simulation_time : datetime, time_step_number : TimeStepInformation, esdl_id : EsdlId, energy_system : EnergySystem):
         pass
