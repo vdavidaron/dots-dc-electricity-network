@@ -22,12 +22,6 @@ P_DC_BASE   = 50.0         # Constant DC load [kW]
 GRID_AVAILABILITY = 0.85    # 85% of hours grid is available
 P_GRID_MAX  = 200.0         # Max grid draw when available [kW]
 
-# ── Electricity Price (synthetic day-ahead) ────────────────────────────────
-PRICE_MEAN  = 0.12          # €/kWh
-PRICE_STD   = 0.05
-PRICE_MIN   = 0.01
-PRICE_MAX   = 0.40
-
 # ── Carbon Intensity ───────────────────────────────────────────────────────
 CI_MEAN     = 250.0         # gCO2/kWh
 CI_STD      = 80.0

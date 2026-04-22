@@ -54,15 +54,12 @@ LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_SIGMA = {
     "CI_grid":  0.12,   # 12 % — ENTSO-E / Staffell & Pfenninger (2016)
-    "price_E":  0.15,   # 15 % — Weron (2014), EPEX SPOT NL
     "p_DC":     0.05,   # 5 %  — Pelley et al. (2009)
 }
 
 # Physical lower bounds — a perturbed forecast must stay above these
 _LOWER_BOUND = {
     "CI_grid":  10.0,   # gCO2/kWh — practically zero-carbon floor
-    "price_E":  0.005,  # €/kWh   — near-zero floor (negative prices exist
-                        #            but are rare; clipping keeps LP feasible)
     "p_DC":     0.0,    # kW      — demand cannot be negative
 }
 
@@ -100,10 +97,9 @@ class ForecastErrorModel:
             self._sigma.update(sigma_overrides)
 
         LOGGER.info(
-            "[ForecastError] Initialized — seed=%d  σ(CI)=%.0f%%  σ(price)=%.0f%%  σ(DC)=%.0f%%",
+            "[ForecastError] Initialized — seed=%d  σ(CI)=%.0f%%  σ(DC)=%.0f%%",
             seed,
             self._sigma["CI_grid"] * 100,
-            self._sigma["price_E"] * 100,
             self._sigma["p_DC"] * 100,
         )
 

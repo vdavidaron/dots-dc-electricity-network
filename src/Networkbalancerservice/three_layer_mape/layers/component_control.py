@@ -20,7 +20,6 @@ class ComponentState:
     p_grid:    float    # Realised grid draw [kW]
     p_DC:      float    # DC load [kW]
     unserved:  float    # Unserved DC load [kW]
-    cost:      float    # Electricity cost this hour [€]
     carbon:    float    # Scope 2 CO2 this hour [gCO2]
     alarm:     bool  = False
     alarm_msg: str   = ""
@@ -35,15 +34,15 @@ class ComponentControlLayer:
     - Returns ComponentState upward for MAPE-K Loop 2 monitoring
     """
 
-    def __init__(self, initial_soc: float = 50.0):
-        self.SOC = initial_soc
+    def __init__(self):
+        pass
 
     def execute_step(
         self,
         setpoint:   float,          # Requested p_ch_b from Change Management [kW]
+        soc_actual: float,          # Actual SOC [%] from external state/sensor
         grid_avail: bool,           # Actual grid availability this hour
         p_DC:       float,          # Actual DC load [kW]
-        price_E:    float,          # Spot price [€/kWh]
         CI_grid:    float,          # Carbon intensity [gCO2/kWh]
         sys_config: SystemConfig,    # Dynamic system configuration
     ) -> ComponentState:
@@ -72,18 +71,16 @@ class ComponentControlLayer:
             else:
                 delta_soc = (p_ref * dt / (sys_config.EFF_DCH * sys_config.E_BAT)) * 100.0
             
-            new_soc = self.SOC + delta_soc
+            new_soc = soc_actual + delta_soc
 
             if new_soc > sys_config.SOC_MAX:
                 # Clamp to max SOC and recalculate p_ref
-                # (SOC_MAX - SOC) / 100 * E_BAT / dt / EFF_CH = p_ref
-                p_ref = ((sys_config.SOC_MAX - self.SOC) / 100.0) * sys_config.E_BAT / (dt * sys_config.EFF_CH)
+                p_ref = ((sys_config.SOC_MAX - soc_actual) / 100.0) * sys_config.E_BAT / (dt * sys_config.EFF_CH)
                 new_soc = sys_config.SOC_MAX
                 alarm, alarm_msg = True, "SOC upper limit — charge clamped"
             elif new_soc < sys_config.SOC_MIN:
                 # Clamp to min SOC and recalculate p_ref
-                # (SOC_MIN - SOC) / 100 * E_BAT / dt * EFF_DCH = p_ref
-                p_ref = ((sys_config.SOC_MIN - self.SOC) / 100.0) * sys_config.E_BAT * sys_config.EFF_DCH / dt
+                p_ref = ((sys_config.SOC_MIN - soc_actual) / 100.0) * sys_config.E_BAT * sys_config.EFF_DCH / dt
                 new_soc = sys_config.SOC_MIN
                 alarm, alarm_msg = True, "SOC lower limit — discharge clamped"
         else:
@@ -106,15 +103,12 @@ class ComponentControlLayer:
             covered  = min(p_DC, abs(p_ref)) if p_ref < 0 else 0.0
             unserved = max(0.0, p_DC - covered)
 
-        # ── Cost and carbon ──────────────────────────────────────────────────
-        cost   = price_E * p_grid * dt          # € (only grid draw costs)
+        # ── Carbon accounting ────────────────────────────────────────────────
         carbon = CI_grid * p_grid * dt          # gCO2
-
-        self.SOC = new_soc
 
         return ComponentState(
             SOC=new_soc, p_ch_b=p_ref, p_grid=p_grid,
             p_DC=p_DC, unserved=unserved,
-            cost=cost, carbon=carbon,
+            carbon=carbon,
             alarm=alarm, alarm_msg=alarm_msg,
         )

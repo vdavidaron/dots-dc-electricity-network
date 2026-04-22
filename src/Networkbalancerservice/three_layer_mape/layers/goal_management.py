@@ -35,7 +35,6 @@ class SystemConfig:
 # ── Shared types ──────────────────────────────────────────────────────────────
 
 class OperationMode(Enum):
-    COST_OPTIMISE   = "cost"
     CARBON_MINIMISE = "carbon"
     NONFIRM         = "nonfirm"
 
@@ -44,7 +43,6 @@ class OperationMode(Enum):
 class Goals:
     mode:           OperationMode
     SOC_target_end: float           # Desired SOC at end of horizon [%]
-    price_E:        pd.Series       # 24h price forecast   [€/kWh]
     CI_grid:        pd.Series       # 24h carbon intensity [gCO2/kWh]
     grid_available: pd.Series       # 24h grid availability [bool]
     p_DC:           pd.Series       # 24h DC load forecast  [kW]
@@ -71,8 +69,8 @@ class GoalManagementLayer:
     nonfirm → minimise unserved load during grid outages (feasibility first)
     """
 
-    def __init__(self, scenario: str = "cost"):
-        assert scenario in ["cost", "carbon", "nonfirm"], f"Unknown scenario: {scenario}"
+    def __init__(self, scenario: str = "carbon"):
+        assert scenario in ["carbon", "nonfirm"], f"Unknown scenario: {scenario}"
         self.scenario  = scenario
         self.goals:    Optional[Goals]        = None
         self.current_schedule:     Optional[SchedulePlan] = None
@@ -85,10 +83,9 @@ class GoalManagementLayer:
         """Ingest day-ahead forecast data into knowledge store."""
         self._knowledge["forecast"] = forecast
         n_outages = int((~forecast["grid_available"]).sum())
-        print(f"[GoalMgmt | Monitor]  forecast loaded — "
-              f"outages={n_outages}h  "
-              f"avg_price={forecast['price_E'].mean():.3f} €/kWh  "
-              f"avg_CI={forecast['CI_grid'].mean():.0f} gCO2/kWh")
+        LOGGER.info(f"[GoalMgmt | Monitor]  forecast loaded — "
+                    f"outages={n_outages}h  "
+                    f"avg_CI={forecast['CI_grid'].mean():.0f} gCO2/kWh")
         return forecast
 
     # ── Analyze ───────────────────────────────────────────────────────────────
@@ -101,7 +98,6 @@ class GoalManagementLayer:
         p_DC           = forecast["p_DC"]
 
         mode_map = {
-            "cost":    OperationMode.COST_OPTIMISE,
             "carbon":  OperationMode.CARBON_MINIMISE,
             "nonfirm": OperationMode.NONFIRM,
         }
@@ -124,7 +120,6 @@ class GoalManagementLayer:
         goals = Goals(
             mode=mode,
             SOC_target_end=soc_target,
-            price_E=price_E,
             CI_grid=CI_grid,
             grid_available=grid_available,
             p_DC=p_DC,
@@ -139,7 +134,7 @@ class GoalManagementLayer:
         """
         PuLP LP — day-ahead charge/discharge schedule.
         """
-        T   = goals.price_E.index
+        T   = goals.CI_grid.index
         n   = len(T)
         dt  = sys_config.dt
 
@@ -151,16 +146,7 @@ class GoalManagementLayer:
         soc     = [pulp.LpVariable(f"soc_{t}",     lowBound=sys_config.SOC_MIN, upBound=sys_config.SOC_MAX) for t in range(n)]
         unserved= [pulp.LpVariable(f"unserved_{t}", lowBound=0) for t in range(n)]
 
-        # ── Objective ─────────────────────────────────────────────────────────
-        if goals.mode == OperationMode.COST_OPTIMISE:
-            # Minimise total electricity cost
-            # Net grid draw = DC load + charging - discharging
-            prob += pulp.lpSum(
-                goals.price_E.iloc[t] * (goals.p_DC.iloc[t] + p_ch[t] - p_dch[t]) * dt
-                for t in range(n)
-            )
-
-        elif goals.mode == OperationMode.CARBON_MINIMISE:
+        if goals.mode == OperationMode.CARBON_MINIMISE:
             # Minimise total Scope 2 CO2
             prob += pulp.lpSum(
                 goals.CI_grid.iloc[t] * (goals.p_DC.iloc[t] + p_ch[t] - p_dch[t]) * dt
@@ -169,13 +155,14 @@ class GoalManagementLayer:
 
         elif goals.mode == OperationMode.NONFIRM:
             # Minimise unserved DC load during outages
-            # Secondary: minimise cost when grid is available
+            # Secondary: minimise carbon when grid is available
             w_unserved = 1e6   # heavy penalty for unserved load
-            w_cost     = 1.0
+            w_carbon   = 1.0
             prob += (
                 w_unserved * pulp.lpSum(unserved[t] for t in range(n))
-                + w_cost   * pulp.lpSum(
-                    goals.price_E.iloc[t] * (goals.p_DC.iloc[t] + p_ch[t] - p_dch[t]) * dt
+                + w_carbon   * pulp.lpSum(
+                    # Grid draw: p_DC + p_ch - p_dch
+                    goals.CI_grid.iloc[t] * (goals.p_DC.iloc[t] + p_ch[t] - p_dch[t]) * dt
                     for t in range(n) if goals.grid_available.iloc[t]
                 )
             )

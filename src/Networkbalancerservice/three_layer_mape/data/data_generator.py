@@ -14,26 +14,7 @@ def generate_timeseries(year: int = config.YEAR, freq: str = config.FREQ) -> pd.
     T = pd.date_range(start=start, periods=config.N_HOURS, freq=freq)
     return T
 
-def simulate_price(T: pd.DatetimeIndex) -> pd.Series:
-    """
-    Synthetic day-ahead electricity price [€/kWh].
-    Adds:
-      - daily pattern (cheap at night, expensive morning/evening peak)
-      - seasonal pattern (higher in winter)
-      - random noise
-    """
-    n = len(T)
-    hour    = T.hour
-    month   = T.month
-
-    daily   = 0.04 * np.sin(2 * np.pi * (hour - 14) / 24)   # peak ~14:00
-    morning = 0.03 * np.exp(-((hour - 8) ** 2) / 8)          # morning ramp
-    seasonal= 0.02 * np.cos(2 * np.pi * (month - 1) / 12)    # winter higher
-    noise   = np.random.normal(0, config.PRICE_STD * 0.5, n)
-
-    price = config.PRICE_MEAN + daily + morning + seasonal + noise
-    price = np.clip(price, config.PRICE_MIN, config.PRICE_MAX)
-    return pd.Series(price, index=T, name="price_E")
+# simulate_price function removed to focus on Carbon and Grid exclusive scope.
 
 
 def simulate_carbon_intensity(T: pd.DatetimeIndex) -> pd.Series:
@@ -106,7 +87,6 @@ def generate_day_ahead_forecast(date: pd.Timestamp) -> dict:
     """
     T_day = pd.date_range(start=date, periods=24, freq="h")
     return {
-        "price_E":        simulate_price(T_day),
         "CI_grid":        simulate_carbon_intensity(T_day),
         "grid_available": simulate_grid_availability(T_day, seed=int(date.timestamp()) % 10000),
         "p_DC":           simulate_dc_load(T_day),
@@ -120,7 +100,6 @@ def generate_full_year() -> pd.DataFrame:
     """
     T = generate_timeseries()
     df = pd.DataFrame({
-        "price_E":        simulate_price(T),
         "CI_grid":        simulate_carbon_intensity(T),
         "grid_available": simulate_grid_availability(T),
         "p_DC":           simulate_dc_load(T),

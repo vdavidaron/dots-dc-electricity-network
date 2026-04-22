@@ -49,11 +49,11 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             self.simulator_configuration.influx_database_name
         )
         self.esdl_obj_mapping = {}
+        self.current_soc = 50.0 
+        self.manual_subs = {}
+        self._manual_subs_registered = False
 
         # ── Forecast error model (calibrated Gaussian perturbation) ───────────
-        # Instantiated once so the RNG state advances consistently across the
-        # full simulation horizon — each call to day_ahead_routing() draws the
-        # next independent noise sample from the same seeded generator.
         self._forecast_error = ForecastErrorModel()
 
         # ── Custom Calculation Setup ──────────────────────────────────────────
@@ -74,6 +74,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.add_calculation(da_info)
 
         dispatch_inputs = [
+            # Only demand_power_w is a formal input to prevent deadlock loop
             SubscriptionDescription(esdl_type="ElectricityDemand", input_name="demand_power_w", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
         ]
         dispatch_outputs = [
@@ -84,7 +85,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         ]
         dispatch_info = HelicsCalculationInformation(
             time_period_in_seconds=900,
-            offset=0,
+            offset=10,
             uninterruptible=False,
             wait_for_current_time_update=False,
             terminate_on_error=True,
@@ -105,7 +106,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             if hasattr(esdl_obj, "id"):
                 self.esdl_obj_mapping[esdl_obj.id] = esdl_obj
         
-        LOGGER.info("Initializing Network Balancer Service (Dynamic mode)...")
+        LOGGER.info("Initializing Network Balancer Service...")
 
         # Default fallback values
         self.grid_import_limit_w = 4_000_000.0
@@ -123,9 +124,9 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         )
 
         # Layers
-        self.goal_layer    = GoalManagementLayer(scenario="cost")
+        self.goal_layer    = GoalManagementLayer(scenario="carbon")
         self.change_layer  = ChangeManagementLayer()
-        self.control_layer = ComponentControlLayer(initial_soc=50.0)
+        self.control_layer = ComponentControlLayer()
 
         self.current_day_step_idx = 0
         self._pending_da_result: Optional[Tuple[Goals, SchedulePlan]] = None
@@ -133,7 +134,6 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         
         self._state_cache = {
             "actual_power_limit_ID": self.grid_import_limit_w,
-            "state_of_charge": 50.0,
             "actual_carbon_intensity_ID": 250.0,
             "available_max_power": 0.0
         }
@@ -158,10 +158,37 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
 
     # ── Calculation Callbacks ─────────────────────────────────────────────────
 
+    def _register_manual_subs_with_handle(self, fed_handle):
+        """Called by framework patch to register manual subs safely."""
+        if self._manual_subs_registered: return
+        from esdl import Battery, PowerPlant
+        
+        for esdl_id in self.simulator_configuration.esdl_ids:
+            network = self.esdl_obj_mapping.get(esdl_id)
+            if not network: continue
+            
+            for port in network.port:
+                for connected_port in port.connectedTo:
+                    asset = connected_port.eContainer()
+                    asset_type = type(asset).__name__
+                    
+                    if asset_type == "Battery":
+                        key = f"Battery/state_of_charge/{asset.id}"
+                        LOGGER.info(f"Manual registration: {key}")
+                        self.manual_subs["soc"] = h.helicsFederateRegisterSubscription(fed_handle, key, "pct")
+                    
+                    elif asset_type == "PowerPlant":
+                        key_lim = f"PowerPlant/actual_power_limit_ID/{asset.id}"
+                        key_ci = f"PowerPlant/actual_carbon_intensity_ID/{asset.id}"
+                        LOGGER.info(f"Manual registration: {key_lim}, {key_ci}")
+                        self.manual_subs["limit"] = h.helicsFederateRegisterSubscription(fed_handle, key_lim, "W")
+                        self.manual_subs["ci"] = h.helicsFederateRegisterSubscription(fed_handle, key_ci, "gCO2/kWh")
+        
+        self._manual_subs_registered = True
+
     def day_ahead_routing(self, param_dict, simulation_time, time_step_number, esdl_id, energy_system):
         self._refresh_system_params(energy_system)
 
-        # ── Extract grid limit plan from PowerplantService ────────────────────
         raw_limit = None
         for k, v in param_dict.items():
             if "power_limit_plan_DA" in k:
@@ -170,7 +197,6 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         grid_limits_kw = self._parse_json_list(raw_limit, self.grid_import_limit_w / 1000.0)
         n = len(grid_limits_kw)
 
-        # ── Extract carbon intensity plan (previously ignored) ────────────────
         raw_ci = None
         for k, v in param_dict.items():
             if "carbon_intensity_plan_DA" in k:
@@ -179,8 +205,6 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         if raw_ci:
             ci_actual = self._parse_json_list(raw_ci, 250.0)
         else:
-            # Fallback: physically-plausible synthetic CI with solar midday dip
-            # CI_MEAN=250, solar dip peak at step 52 (13:00), seasonal offset
             month = simulation_time.month
             seasonal_offset = 40.0 * np.cos(2 * np.pi * (month - 1) / 12)
             ci_actual = [
@@ -192,34 +216,13 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                 for i in range(n)
             ]
 
-        # ── Price signal: use data_generator pattern centred on PRICE_MEAN ────
-        # Realistic daily price shape: cheap at night, peak morning + evening.
-        price_actual = [
-            float(np.clip(
-                0.12
-                + 0.04 * np.sin(2 * np.pi * (i / (n / 24) - 14 / 24))   # daily peak at 14:00
-                + 0.03 * np.exp(-((i / (n / 24) - 8) ** 2) / 8),         # morning ramp
-                0.01, 0.40
-            ))
-            for i in range(n)
-        ]
-
-        # ── DC load: ESDL base load with realistic ±3% hourly texture ─────────
         dc_base_kw = self.dc_base_load_w / 1000.0
         hour_texture = [
             dc_base_kw * (1.0 + 0.03 * np.sin(2 * np.pi * i / n))
             for i in range(n)
         ]
 
-        # ── Apply calibrated Gaussian forecast error ──────────────────────────
-        # Each signal is perturbed independently using literature-calibrated σ:
-        #   CI_grid : σ=12%  (ENTSO-E forecast accuracy; Staffell & Pfenninger 2016)
-        #   price_E : σ=15%  (Weron 2014, EPEX SPOT NL day-ahead)
-        #   p_DC    : σ=5%   (Pelley et al. 2009, large DC load variability)
-        # The actual (unperturbed) values are used by the intra-day MPC layer,
-        # creating realistic deviation events that test RQ4.
         forecast = {
-            "price_E":        self._forecast_error.perturb("price_E",  pd.Series(price_actual)),
             "CI_grid":        self._forecast_error.perturb("CI_grid",  pd.Series(ci_actual)),
             "grid_available": pd.Series([(v > 0) for v in grid_limits_kw]),
             "p_DC":           self._forecast_error.perturb("p_DC",     pd.Series(hour_texture)),
@@ -227,16 +230,15 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
 
         LOGGER.info(
             "[DA Forecast] t=%s  n=%d steps  "
-            "CI_mean=%.0f→%.0f gCO2/kWh  price_mean=%.3f→%.3f €/kWh  "
+            "CI_mean=%.0f→%.0f gCO2/kWh  "
             "p_DC_mean=%.0f→%.0f kW",
             simulation_time.isoformat(), n,
             float(pd.Series(ci_actual).mean()),    float(forecast["CI_grid"].mean()),
-            float(pd.Series(price_actual).mean()), float(forecast["price_E"].mean()),
             float(pd.Series(hour_texture).mean()), float(forecast["p_DC"].mean()),
         )
 
         self.current_day_step_idx = 0
-        threading.Thread(target=self._run_day_ahead_lp, args=(forecast, self.control_layer.SOC), daemon=True).start()
+        threading.Thread(target=self._run_day_ahead_lp, args=(forecast, self.current_soc), daemon=True).start()
         return {}
 
     def network_dispatch(self, param_dict, simulation_time, time_step_number, esdl_id, energy_system):
@@ -245,34 +247,43 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             self._pending_da_result = None
             self.change_layer.load_day_ahead_plan(goals, plan)
 
-        demand_w = 0.0
-        for k, v in param_dict.items():
-            if "demand_power_w" in k:
-                demand_w = v; break
+        # ── 1. READ inputs ──
+        demand_w = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "demand_power_w")
+        if demand_w is None: demand_w = 0.0
         
-        # In absence of direct input, use ESDL-defined limit
+        soc_actual = self.current_soc
+        sub_soc = self.manual_subs.get("soc")
+        if sub_soc and h.helicsInputIsUpdated(sub_soc):
+            soc_actual = h.helicsInputGetDouble(sub_soc)
+            self.current_soc = soc_actual
+
+        sub_lim = self.manual_subs.get("limit")
+        if sub_lim and h.helicsInputIsUpdated(sub_lim):
+            self._state_cache["actual_power_limit_ID"] = h.helicsInputGetDouble(sub_lim)
+
+        sub_ci = self.manual_subs.get("ci")
+        if sub_ci and h.helicsInputIsUpdated(sub_ci):
+            self._state_cache["actual_carbon_intensity_ID"] = h.helicsInputGetDouble(sub_ci)
+        
         limit_w      = self._state_cache["actual_power_limit_ID"]
-        actual_soc   = self._state_cache["state_of_charge"]
         ci_val       = self._state_cache["actual_carbon_intensity_ID"]
         
         grid_available = limit_w > 0.0
         p_dc_kw = demand_w / 1_000.0
-        self.control_layer.SOC = actual_soc
 
         setpoint_kw = 0.0
         if self.change_layer.plan is not None:
             step = min(self.current_day_step_idx, len(self.change_layer.plan.p_ch_b) - 1)
-            # Pass actual demand so demand spikes can trigger replanning
-            state = self.change_layer.monitor(step, actual_soc, grid_available, p_dc_actual_kw=p_dc_kw)
+            state = self.change_layer.monitor(step, soc_actual, grid_available, p_dc_actual_kw=p_dc_kw)
             event = self.change_layer.analyze(state)
             if event.triggered_replan and not self._mpc_running:
                 self._mpc_running = True
                 threading.Thread(target=self._run_mpc_replan, args=(event,), daemon=True).start()
             setpoint_kw = float(self.change_layer.plan.p_ch_b.iloc[step])
         else:
-            setpoint_kw = self._heuristic_fallback(actual_soc, limit_w, demand_w)
+            setpoint_kw = self._heuristic_fallback(soc_actual, limit_w, demand_w)
 
-        exec_state = self.control_layer.execute_step(setpoint_kw, grid_available, p_dc_kw, 0.12, ci_val, self.sys_config)
+        exec_state = self.control_layer.execute_step(setpoint_kw, soc_actual, grid_available, p_dc_kw, ci_val, self.sys_config)
         
         self.current_day_step_idx += 1
 
@@ -284,7 +295,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_BESS_W", simulation_time, bess_w)
         self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Requested_Power_W", simulation_time, backup_w)
         self.influx_connector.set_time_step_data_point(esdl_id, "Total_Routed_Demand_W", simulation_time, demand_w)
-        # Demand delta vs day-ahead forecast (thesis SQ3 — MPC replan analysis)
+        
         if self.change_layer.goals is not None:
             step_idx = max(0, self.current_day_step_idx - 1)
             da_step  = min(step_idx, len(self.change_layer.goals.p_DC) - 1)
@@ -309,31 +320,24 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             eClass = getattr(obj, "eClass", None)
             if not eClass: continue
             
-            # Battery
             if eClass.name == "Battery":
                 self.sys_config.E_BAT = float(getattr(obj, "capacity", 0.0))
                 self.sys_config.P_CH_MAX = float(getattr(obj, "maxChargeRate", 0.0)) / 1000.0
                 self.sys_config.P_DCH_MAX = float(getattr(obj, "maxDischargeRate", 0.0)) / 1000.0
                 self.sys_config.EFF_CH = float(getattr(obj, "chargeEfficiency", 0.95))
                 self.sys_config.EFF_DCH = float(getattr(obj, "dischargeEfficiency", 0.95))
-                LOGGER.info(f"[ESDL] Battery: {self.sys_config.E_BAT}kWh, {self.sys_config.P_CH_MAX*1000}W")
 
-            # Grid Connection (PowerPlant in this scenario)
             elif eClass.name == "PowerPlant":
                 self.grid_import_limit_w = float(getattr(obj, "power", 4000000.0))
-                LOGGER.info(f"[ESDL] Grid Limit: {self.grid_import_limit_w}W")
 
-            # Datacenter Load (ElectricityDemand)
             elif eClass.name == "ElectricityDemand":
                 self.dc_base_load_w = float(getattr(obj, "power", 4000000.0))
-                LOGGER.info(f"[ESDL] DC Base Load: {self.dc_base_load_w}W")
 
     def _parse_json_list(self, raw, default_kw):
         if not raw: return [default_kw] * 96
         try:
             data = json.loads(raw)
             if isinstance(data, list):
-                # If values are in Watts, convert to kW for the solver
                 return [float(x.get("value", x))/1000.0 if isinstance(x, dict) else float(x)/1000.0 for x in data]
             return [float(data)/1000.0] * 96
         except: return [default_kw] * 96
