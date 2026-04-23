@@ -68,14 +68,18 @@ class TestNetworkBalancer(unittest.TestCase):
 
         # 2. Test Network Dispatch (Only demand_power_w expected)
         # ------------------------------------------------------
+        demand_w = 3500000.0
         param_dict_dispatch = {
-            "ElectricityDemand/demand_power_w/None": 3500000.0
+            "ElectricityDemand/demand_power_w/None": demand_w
         }
         
         output = service.network_dispatch(param_dict_dispatch, START_DATE_TIME, time_info, esdl_id, self.energy_system)
         
         self.assertIsNotNone(output)
-        self.assertEqual(output.grid_allocation_w, 3500000.0) # Should cover load
+        # Energy balance: Grid + BESS should cover the DC Demand
+        # Note: BESS is (+ discharge / - charge)
+        total_delivered_w = output.grid_allocation_w + output.bess_allocation_w
+        self.assertAlmostEqual(total_delivered_w, demand_w, places=1, msg="Energy balance failed: Grid + BESS != Demand")
         self.assertEqual(service.current_day_step_idx, 1)
 
 if __name__ == '__main__':

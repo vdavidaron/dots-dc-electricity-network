@@ -179,15 +179,14 @@ class ChangeManagementLayer:
         """
         hour     = event.hour
         soc_init = event.soc_actual
-        n_total  = len(self.goals.price_E)
+        n_total  = len(self.goals.p_DC)
         horizon  = min(self.MPC_HORIZON, n_total - hour)
 
         if horizon <= 0:
             return self.plan
 
         # Slice forecast to MPC window
-        T_mpc   = self.goals.price_E.index[hour: hour + horizon]
-        price   = self.goals.price_E.iloc[hour: hour + horizon]
+        T_mpc   = self.goals.p_DC.index[hour: hour + horizon]
         ci      = self.goals.CI_grid.iloc[hour: hour + horizon]
         avail   = self.goals.grid_available.iloc[hour: hour + horizon]
         mode    = self.goals.mode
@@ -217,12 +216,7 @@ class ChangeManagementLayer:
         unserved = [pulp.LpVariable(f"mpc_uns_{t}",  lowBound=0) for t in range(n)]
 
         # Objective — same as Goal Management
-        if mode == OperationMode.COST_OPTIMISE:
-            prob += pulp.lpSum(
-                price.iloc[t] * (p_dc.iloc[t] + p_ch[t] - p_dch[t]) * dt
-                for t in range(n)
-            )
-        elif mode == OperationMode.CARBON_MINIMISE:
+        if mode == OperationMode.CARBON_MINIMISE:
             prob += pulp.lpSum(
                 ci.iloc[t] * (p_dc.iloc[t] + p_ch[t] - p_dch[t]) * dt
                 for t in range(n)
@@ -231,7 +225,8 @@ class ChangeManagementLayer:
             prob += (
                 1e6 * pulp.lpSum(unserved[t] for t in range(n))
                 + pulp.lpSum(
-                    price.iloc[t] * (p_dc.iloc[t] + p_ch[t] - p_dch[t]) * dt
+                    # Grid draw: p_DC + p_ch - p_dch
+                    ci.iloc[t] * (p_dc.iloc[t] + p_ch[t] - p_dch[t]) * dt
                     for t in range(n) if bool(avail.iloc[t])
                 )
             )

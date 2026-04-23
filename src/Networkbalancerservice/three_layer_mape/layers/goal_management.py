@@ -18,6 +18,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import pulp
+from dots_infrastructure.Logger import LOGGER
 
 
 @dataclass
@@ -92,7 +93,6 @@ class GoalManagementLayer:
 
     def analyze(self, forecast: dict, sys_config: SystemConfig) -> Goals:
         """Select operation mode and compute SOC target."""
-        price_E        = forecast["price_E"]
         CI_grid        = forecast["CI_grid"]
         grid_available = forecast["grid_available"]
         p_DC           = forecast["p_DC"]

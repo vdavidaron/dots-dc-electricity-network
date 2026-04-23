@@ -3,6 +3,7 @@ from typing import Optional, Tuple, Dict, Any, List
 import threading
 import logging
 import json
+import math
 
 from esdl import esdl, EnergySystem
 import helics as h
@@ -120,7 +121,9 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             E_BAT=self.sys_config.E_BAT if hasattr(self, 'sys_config') else 0.0, 
             P_CH_MAX=self.sys_config.P_CH_MAX if hasattr(self, 'sys_config') else 0.0, 
             P_DCH_MAX=self.sys_config.P_DCH_MAX if hasattr(self, 'sys_config') else 0.0, 
-            P_GRID_MAX=self.grid_import_limit_w / 1000.0
+            P_GRID_MAX=self.grid_import_limit_w / 1000.0,
+            SOC_MIN=0.0,
+            SOC_MAX=100.0
         )
 
         # Layers
@@ -161,7 +164,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
     def _register_manual_subs_with_handle(self, fed_handle):
         """Called by framework patch to register manual subs safely."""
         if self._manual_subs_registered: return
-        from esdl import Battery, PowerPlant
+        from esdl import Battery, PowerPlant, PVInstallation
         
         for esdl_id in self.simulator_configuration.esdl_ids:
             network = self.esdl_obj_mapping.get(esdl_id)
@@ -174,8 +177,10 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                     
                     if asset_type == "Battery":
                         key = f"Battery/state_of_charge/{asset.id}"
-                        LOGGER.info(f"Manual registration: {key}")
+                        key_pwr = f"Battery/bess_power_w/{asset.id}"
+                        LOGGER.info(f"Manual registration: {key}, {key_pwr}")
                         self.manual_subs["soc"] = h.helicsFederateRegisterSubscription(fed_handle, key, "pct")
+                        self.manual_subs["bess_actual"] = h.helicsFederateRegisterSubscription(fed_handle, key_pwr, "W")
                     
                     elif asset_type == "PowerPlant":
                         key_lim = f"PowerPlant/actual_power_limit_ID/{asset.id}"
@@ -183,6 +188,11 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                         LOGGER.info(f"Manual registration: {key_lim}, {key_ci}")
                         self.manual_subs["limit"] = h.helicsFederateRegisterSubscription(fed_handle, key_lim, "W")
                         self.manual_subs["ci"] = h.helicsFederateRegisterSubscription(fed_handle, key_ci, "gCO2/kWh")
+
+                    elif asset_type == "PVInstallation":
+                        key_res = f"PVInstallation/supplied_power_ID/{asset.id}"
+                        LOGGER.info(f"Manual registration: {key_res}")
+                        self.manual_subs["solar"] = h.helicsFederateRegisterSubscription(fed_handle, key_res, "W")
         
         self._manual_subs_registered = True
 
@@ -253,9 +263,12 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         
         soc_actual = self.current_soc
         sub_soc = self.manual_subs.get("soc")
-        if sub_soc and h.helicsInputIsUpdated(sub_soc):
-            soc_actual = h.helicsInputGetDouble(sub_soc)
-            self.current_soc = soc_actual
+        if sub_soc:
+            # Always try to get latest SoC
+            val = h.helicsInputGetDouble(sub_soc)
+            if not math.isnan(val):
+                soc_actual = val
+                self.current_soc = soc_actual
 
         sub_lim = self.manual_subs.get("limit")
         if sub_lim and h.helicsInputIsUpdated(sub_lim):
@@ -281,15 +294,23 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                 threading.Thread(target=self._run_mpc_replan, args=(event,), daemon=True).start()
             setpoint_kw = float(self.change_layer.plan.p_ch_b.iloc[step])
         else:
+            # Heuristic fallback uses (+ discharge / - charge) convention
             setpoint_kw = self._heuristic_fallback(soc_actual, limit_w, demand_w)
 
         exec_state = self.control_layer.execute_step(setpoint_kw, soc_actual, grid_available, p_dc_kw, ci_val, self.sys_config)
         
         self.current_day_step_idx += 1
 
+        # BESS Allocation: (+ discharge / - charge)
         bess_w = exec_state.p_ch_b * 1000.0
         grid_w = exec_state.p_grid * 1000.0
         backup_w = exec_state.unserved * 1000.0
+
+        # Detailed Logging
+        self.influx_connector.set_time_step_data_point(esdl_id, "Actual_SOC_from_Battery", simulation_time, soc_actual)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Setpoint_from_Layers_kW", simulation_time, setpoint_kw)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Grid_Available", simulation_time, 1.0 if grid_available else 0.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Carbon_Intensity", simulation_time, ci_val)
 
         self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_Grid_W", simulation_time, grid_w)
         self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_BESS_W", simulation_time, bess_w)
@@ -321,7 +342,8 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             if not eClass: continue
             
             if eClass.name == "Battery":
-                self.sys_config.E_BAT = float(getattr(obj, "capacity", 0.0))
+                # FIX: Convert Wh to kWh for optimization layers
+                self.sys_config.E_BAT = float(getattr(obj, "capacity", 0.0)) / 1000.0
                 self.sys_config.P_CH_MAX = float(getattr(obj, "maxChargeRate", 0.0)) / 1000.0
                 self.sys_config.P_DCH_MAX = float(getattr(obj, "maxDischargeRate", 0.0)) / 1000.0
                 self.sys_config.EFF_CH = float(getattr(obj, "chargeEfficiency", 0.95))
@@ -343,10 +365,13 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         except: return [default_kw] * 96
 
     def _heuristic_fallback(self, soc, limit_w, demand_w):
-        if limit_w > demand_w and soc < 80.0:
-            return min(self.sys_config.P_CH_MAX, (limit_w - demand_w)/1000.0)
-        elif limit_w < demand_w and soc > 20.0:
-            return -min(self.sys_config.P_DCH_MAX, (demand_w - limit_w)/1000.0)
+        # Convention: + discharge / - charge
+        if limit_w > demand_w and soc < 95.0:
+            # Grid surplus: charge battery (negative)
+            return -min(self.sys_config.P_CH_MAX, (limit_w - demand_w)/1000.0)
+        elif limit_w < demand_w and soc > 5.0:
+            # Grid deficit: discharge battery (positive)
+            return min(self.sys_config.P_DCH_MAX, (demand_w - limit_w)/1000.0)
         return 0.0
 
 if __name__ == "__main__":
