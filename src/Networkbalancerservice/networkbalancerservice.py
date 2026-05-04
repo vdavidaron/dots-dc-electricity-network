@@ -50,9 +50,9 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             self.simulator_configuration.influx_database_name
         )
         self.esdl_obj_mapping = {}
-        self.current_soc = 50.0 
-        self.manual_subs = {}
-        self._manual_subs_registered = False
+        self.current_soc = 50.0
+        self._shadow_subs = {}  # HELICS inputs registered outside framework tracking
+
 
         # ── Forecast error model (calibrated Gaussian perturbation) ───────────
         self._forecast_error = ForecastErrorModel()
@@ -75,9 +75,18 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.add_calculation(da_info)
 
         dispatch_inputs = [
-            # Only demand_power_w is a formal input to prevent deadlock loop
+            # ONLY demand_power_w as formal input — Battery/PowerPlant are read
+            # via shadow subscriptions to avoid circular-dependency deadlock
+            # (Battery waits for bess_allocation_w from us, we'd wait for state_of_charge).
             SubscriptionDescription(esdl_type="ElectricityDemand", input_name="demand_power_w", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
         ]
+        # Shadow subscription keys — registered during init, read non-blockingly
+        self._shadow_sub_keys = {
+            "soc":    ("Battery",     "state_of_charge",         "pct"),
+            "bess":   ("Battery",     "bess_power_w",            "W"),
+            "limit":  ("PowerPlant",  "actual_power_limit_ID",   "W"),
+            "ci":     ("PowerPlant",  "actual_carbon_intensity_ID", "gCO2/kWh"),
+        }
         dispatch_outputs = [
             PublicationDescription(global_flag=True, esdl_type="ElectricityNetwork", output_name="bess_allocation_w", output_unit="W", data_type=h.HelicsDataType.DOUBLE),
             PublicationDescription(global_flag=True, esdl_type="ElectricityNetwork", output_name="grid_allocation_w", output_unit="W", data_type=h.HelicsDataType.DOUBLE),
@@ -96,6 +105,47 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             calculation_function=self.network_dispatch
         )
         self.add_calculation(dispatch_info)
+
+    # ── Shadow subscription registration ──────────────────────────────────────
+
+    def start_simulation(self):
+        """Override to inject shadow HELICS subscriptions before execution mode."""
+        self._assert_that_periods_of_calculation_are_smaller_than_simulation_duration()
+        esdl_helper = self.init_simulation()
+
+        from concurrent.futures import ThreadPoolExecutor
+        self.exe = ThreadPoolExecutor(len(self.calculations))
+        for calc_executor in self.calculations:
+            calc_name = calc_executor.helics_value_federate_info.calculation_name
+            if calc_name == "network_dispatch":
+                # Wrap to inject shadow subs between init and exec mode
+                self.exe.submit(self._init_dispatch_with_shadow_subs, calc_executor, esdl_helper)
+            else:
+                self.exe.submit(calc_executor.initialize_and_start_federate, esdl_helper)
+
+    def _init_dispatch_with_shadow_subs(self, calc_executor, esdl_helper):
+        """init_federate → register shadow subs → start loop."""
+        calc_executor.init_federate(esdl_helper)
+        fed = calc_executor.value_federate
+
+        # Resolve connected Battery/PowerPlant asset IDs from ESDL
+        for esdl_id in self.simulator_configuration.esdl_ids:
+            network = self.esdl_obj_mapping.get(esdl_id)
+            if not network:
+                continue
+            for port in network.port:
+                for cp in port.connectedTo:
+                    asset = cp.eContainer()
+                    atype = type(asset).__name__
+                    for alias, (esdl_type, name, unit) in self._shadow_sub_keys.items():
+                        if atype == esdl_type and alias not in self._shadow_subs:
+                            key = f"{esdl_type}/{name}/{asset.id}"
+                            sub = h.helicsFederateRegisterSubscription(fed, key, unit)
+                            self._shadow_subs[alias] = sub
+                            LOGGER.info(f"Shadow subscription registered: {key}")
+
+        calc_executor.energy_system = esdl_helper.energy_system
+        calc_executor.start_value_federate()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -124,6 +174,16 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             P_GRID_MAX=self.grid_import_limit_w / 1000.0,
             SOC_MIN=0.0,
             SOC_MAX=100.0
+        )
+
+        LOGGER.info(
+            "SystemConfig: dt=%.2f  E_BAT=%.1f kWh  P_CH=%.1f kW  P_DCH=%.1f kW  "
+            "P_GRID=%.1f kW  SOC=[%.0f,%.0f]%%  EFF_CH=%.2f  EFF_DCH=%.2f",
+            self.sys_config.dt, self.sys_config.E_BAT,
+            self.sys_config.P_CH_MAX, self.sys_config.P_DCH_MAX,
+            self.sys_config.P_GRID_MAX,
+            self.sys_config.SOC_MIN, self.sys_config.SOC_MAX,
+            self.sys_config.EFF_CH, self.sys_config.EFF_DCH,
         )
 
         # Layers
@@ -161,40 +221,6 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
 
     # ── Calculation Callbacks ─────────────────────────────────────────────────
 
-    def _register_manual_subs_with_handle(self, fed_handle):
-        """Called by framework patch to register manual subs safely."""
-        if self._manual_subs_registered: return
-        from esdl import Battery, PowerPlant, PVInstallation
-        
-        for esdl_id in self.simulator_configuration.esdl_ids:
-            network = self.esdl_obj_mapping.get(esdl_id)
-            if not network: continue
-            
-            for port in network.port:
-                for connected_port in port.connectedTo:
-                    asset = connected_port.eContainer()
-                    asset_type = type(asset).__name__
-                    
-                    if asset_type == "Battery":
-                        key = f"Battery/state_of_charge/{asset.id}"
-                        key_pwr = f"Battery/bess_power_w/{asset.id}"
-                        LOGGER.info(f"Manual registration: {key}, {key_pwr}")
-                        self.manual_subs["soc"] = h.helicsFederateRegisterSubscription(fed_handle, key, "pct")
-                        self.manual_subs["bess_actual"] = h.helicsFederateRegisterSubscription(fed_handle, key_pwr, "W")
-                    
-                    elif asset_type == "PowerPlant":
-                        key_lim = f"PowerPlant/actual_power_limit_ID/{asset.id}"
-                        key_ci = f"PowerPlant/actual_carbon_intensity_ID/{asset.id}"
-                        LOGGER.info(f"Manual registration: {key_lim}, {key_ci}")
-                        self.manual_subs["limit"] = h.helicsFederateRegisterSubscription(fed_handle, key_lim, "W")
-                        self.manual_subs["ci"] = h.helicsFederateRegisterSubscription(fed_handle, key_ci, "gCO2/kWh")
-
-                    elif asset_type == "PVInstallation":
-                        key_res = f"PVInstallation/supplied_power_ID/{asset.id}"
-                        LOGGER.info(f"Manual registration: {key_res}")
-                        self.manual_subs["solar"] = h.helicsFederateRegisterSubscription(fed_handle, key_res, "W")
-        
-        self._manual_subs_registered = True
 
     def day_ahead_routing(self, param_dict, simulation_time, time_step_number, esdl_id, energy_system):
         self._refresh_system_params(energy_system)
@@ -257,27 +283,46 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             self._pending_da_result = None
             self.change_layer.load_day_ahead_plan(goals, plan)
 
+        try:
+            return self._do_network_dispatch(param_dict, simulation_time, time_step_number, esdl_id, energy_system)
+        except Exception as exc:
+            LOGGER.error(f"network_dispatch CRASHED at t={simulation_time}, step={self.current_day_step_idx}: {exc}", exc_info=True)
+            raise
+
+    def _read_shadow_sub(self, alias: str):
+        """Non-blocking read of a shadow HELICS subscription. Returns value or None."""
+        sub = self._shadow_subs.get(alias)
+        if sub is None:
+            return None
+        try:
+            val = h.helicsInputGetDouble(sub)
+            return val if not math.isnan(val) else None
+        except Exception:
+            return None
+
+    def _do_network_dispatch(self, param_dict, simulation_time, time_step_number, esdl_id, energy_system):
         # ── 1. READ inputs ──
+        # demand_power_w: formal framework input (blocking wait handled by framework)
         demand_w = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "demand_power_w")
         if demand_w is None: demand_w = 0.0
-        
+
+        # Battery SOC: shadow subscription (non-blocking)
         soc_actual = self.current_soc
-        sub_soc = self.manual_subs.get("soc")
-        if sub_soc:
-            # Always try to get latest SoC
-            val = h.helicsInputGetDouble(sub_soc)
-            if not math.isnan(val):
-                soc_actual = val
-                self.current_soc = soc_actual
+        soc_val = self._read_shadow_sub("soc")
+        if soc_val is not None:
+            soc_actual = soc_val
+            self.current_soc = soc_actual
 
-        sub_lim = self.manual_subs.get("limit")
-        if sub_lim and h.helicsInputIsUpdated(sub_lim):
-            self._state_cache["actual_power_limit_ID"] = h.helicsInputGetDouble(sub_lim)
+        # PowerPlant grid limit: shadow subscription (non-blocking)
+        lim_val = self._read_shadow_sub("limit")
+        if lim_val is not None:
+            self._state_cache["actual_power_limit_ID"] = lim_val
 
-        sub_ci = self.manual_subs.get("ci")
-        if sub_ci and h.helicsInputIsUpdated(sub_ci):
-            self._state_cache["actual_carbon_intensity_ID"] = h.helicsInputGetDouble(sub_ci)
-        
+        # PowerPlant carbon intensity: shadow subscription (non-blocking)
+        ci_val = self._read_shadow_sub("ci")
+        if ci_val is not None:
+            self._state_cache["actual_carbon_intensity_ID"] = ci_val
+
         limit_w      = self._state_cache["actual_power_limit_ID"]
         ci_val       = self._state_cache["actual_carbon_intensity_ID"]
         
@@ -292,7 +337,12 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             if event.triggered_replan and not self._mpc_running:
                 self._mpc_running = True
                 threading.Thread(target=self._run_mpc_replan, args=(event,), daemon=True).start()
-            setpoint_kw = float(self.change_layer.plan.p_ch_b.iloc[step])
+            raw_setpoint = self.change_layer.plan.p_ch_b.iloc[step]
+            if raw_setpoint is None or (isinstance(raw_setpoint, float) and math.isnan(raw_setpoint)):
+                LOGGER.warning("Plan setpoint is NaN/None at step %d, using heuristic", step)
+                setpoint_kw = self._heuristic_fallback(soc_actual, limit_w, demand_w)
+            else:
+                setpoint_kw = float(raw_setpoint)
         else:
             # Heuristic fallback uses (+ discharge / - charge) convention
             setpoint_kw = self._heuristic_fallback(soc_actual, limit_w, demand_w)
@@ -327,7 +377,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             bess_allocation_w=bess_w,
             grid_allocation_w=grid_w,
             current_max_power_limit=limit_w,
-            backup_requested_power=backup_w
+            backup_requested_power=backup_w,
         )
 
     # ── Helpers ──────────────────────────────────────────────────────────────

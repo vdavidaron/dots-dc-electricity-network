@@ -60,10 +60,12 @@ class ChangeManagementLayer:
     SOC_DRIFT_THRESHOLD    = 5.0   # [%]  — replan if SOC drifts more than this
     DEMAND_SPIKE_THRESHOLD = 0.10   # [fraction] — replan if actual demand > forecast by 10 %
     MPC_HORIZON            = 6     # timesteps — rolling window for MPC re-solve
+    REPLAN_COOLDOWN        = 4     # steps to wait between replans (4 × 15min = 1h)
 
     def __init__(self):
         self.plan:     Optional[SchedulePlan] = None
         self.goals:    Optional[Goals]        = None
+        self._steps_since_replan: int = 999  # allow replan on first trigger
         self._knowledge: dict = {
             "soc_history":    [],
             "demand_history": [],
@@ -133,11 +135,14 @@ class ChangeManagementLayer:
             and (demand_delta / p_dc_forecast_kw) > self.DEMAND_SPIKE_THRESHOLD
         )
 
-        triggered = (
+        # Only allow replan if cooldown has elapsed
+        deviation_detected = (
             soc_drift > self.SOC_DRIFT_THRESHOLD
             or unplanned_outage
             or demand_spike
         )
+        triggered = deviation_detected and self._steps_since_replan >= self.REPLAN_COOLDOWN
+        self._steps_since_replan += 1
 
         event = DeviationEvent(
             hour=hour,
@@ -260,20 +265,33 @@ class ChangeManagementLayer:
         solver = pulp.PULP_CBC_CMD(msg=0, threads=1, keepFiles=False)
         prob.solve(solver)
 
+        status = pulp.LpStatus[prob.status]
+        self._knowledge["replan_count"] += 1
+        self._steps_since_replan = 0  # reset cooldown
+
+        if status != "Optimal":
+            print(f"[ChangeMgmt | Plan]  MPC replan #{self._knowledge['replan_count']} "
+                  f"h={hour}->{hour+horizon-1}  LP status={status} — keeping existing plan")
+            return self.plan
+
         # Merge MPC solution back into full-day plan
+        # Convention: positive = discharge, negative = charge
         merged_p   = self.plan.p_ch_b.copy()
         merged_soc = self.plan.SOC_plan.copy()
 
         for t in range(n):
             idx = hour + t
-            merged_p.iloc[idx]   = pulp.value(p_ch[t]) - pulp.value(p_dch[t])
-            merged_soc.iloc[idx] = pulp.value(soc_var[t])
+            val_dch = pulp.value(p_dch[t])
+            val_ch  = pulp.value(p_ch[t])
+            val_soc = pulp.value(soc_var[t])
+            if val_dch is not None and val_ch is not None:
+                merged_p.iloc[idx] = val_dch - val_ch
+            if val_soc is not None:
+                merged_soc.iloc[idx] = val_soc
 
         self.plan = SchedulePlan(p_ch_b=merged_p, SOC_plan=merged_soc, source="mpc")
-        self._knowledge["replan_count"] += 1
         print(f"[ChangeMgmt | Plan]  MPC replan #{self._knowledge['replan_count']} "
-              f"h={hour}->{hour+horizon-1}  "
-              f"LP status={pulp.LpStatus[prob.status]}")
+              f"h={hour}->{hour+horizon-1}  LP status={status}")
         return self.plan
 
     # ── Execute ───────────────────────────────────────────────────────────────

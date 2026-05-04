@@ -213,12 +213,26 @@ class GoalManagementLayer:
         solver = pulp.PULP_CBC_CMD(msg=0, threads=1, keepFiles=False)
         prob.solve(solver)
         status = pulp.LpStatus[prob.status]
-        print(f"[GoalMgmt | Plan]    LP status={status}  "
-              f"objective={pulp.value(prob.objective):.2f}")
+        obj_val = pulp.value(prob.objective)
+        obj_str = f"{obj_val:.2f}" if obj_val is not None else "N/A"
+        print(f"[GoalMgmt | Plan]    LP status={status}  objective={obj_str}")
+
+        # ── Guard: infeasible LP → return zero-setpoint fallback plan ─────────
+        if status != "Optimal":
+            print(f"[GoalMgmt | Plan]    LP {status} — returning zero-setpoint fallback")
+            p_net = pd.Series([0.0] * n, index=T, name="p_ch_b")
+            soc_s = pd.Series([soc_init] * n, index=T, name="SOC_plan")
+            schedule = SchedulePlan(p_ch_b=p_net, SOC_plan=soc_s, source="lp_fallback")
+            self._knowledge["plan"] = schedule
+            self.current_schedule = schedule
+            self.goals = goals
+            return schedule
 
         # ── Extract solution ──────────────────────────────────────────────────
+        # Convention: positive = discharge, negative = charge
+        # (matches ComponentControlLayer expectation)
         p_net  = pd.Series(
-            [pulp.value(p_ch[t]) - pulp.value(p_dch[t]) for t in range(n)],
+            [pulp.value(p_dch[t]) - pulp.value(p_ch[t]) for t in range(n)],
             index=T, name="p_ch_b"
         )
         soc_s  = pd.Series(
