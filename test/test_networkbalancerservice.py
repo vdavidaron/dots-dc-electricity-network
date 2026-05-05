@@ -217,8 +217,8 @@ class TestChangeManagementLayer(unittest.TestCase):
         """After a replan trigger, subsequent triggers should be suppressed for COOLDOWN steps."""
         change_layer, goals, plan = self._load_plan()
 
-        soc_planned = float(plan.SOC_plan.iloc[0])
-        soc_drifted = soc_planned - 15.0
+        soc_planned_0 = float(plan.SOC_plan.iloc[0])
+        soc_drifted = soc_planned_0 - 20.0  # Drift of 20% (well above 5% threshold)
 
         # First trigger at step 0 — should fire
         state = change_layer.monitor(0, soc_drifted, True, p_dc_actual_kw=4000.0)
@@ -229,11 +229,6 @@ class TestChangeManagementLayer(unittest.TestCase):
         change_layer._steps_since_replan = 0
 
         # Steps 1-4 should be suppressed:
-        # analyze checks _steps_since_replan >= COOLDOWN(4), then increments
-        # step 1: check 0>=4 → F, inc→1
-        # step 2: check 1>=4 → F, inc→2
-        # step 3: check 2>=4 → F, inc→3
-        # step 4: check 3>=4 → F, inc→4
         for step in range(1, 5):
             state = change_layer.monitor(step, soc_drifted, True, p_dc_actual_kw=4000.0)
             event = change_layer.analyze(state)
@@ -410,6 +405,37 @@ class TestComponentControlLayer(unittest.TestCase):
         covered = result.p_grid + result.p_ch_b + result.unserved
         self.assertAlmostEqual(covered, result.p_DC, places=1,
                                msg="Grid + BESS + unserved must equal DC demand")
+
+    def test_battery_carbon_tracking(self):
+        """Verify that battery CI is tracked correctly during charge/discharge."""
+        cfg = _test_sys_config()
+        ctrl = ComponentControlLayer()
+
+        # Step 1: Charge battery with clean energy (50 gCO2/kWh)
+        res1 = ctrl.execute_step(
+            setpoint=-1000.0,   # Charge
+            soc_actual=10.0,
+            grid_avail=True,
+            p_DC=4000.0,
+            CI_grid=50.0,
+            sys_config=cfg,
+            CI_battery_prev=250.0
+        )
+        self.assertLess(res1.CI_battery, 250.0, "Battery CI should decrease after charging with clean energy")
+
+        # Step 2: Discharge battery into DC load
+        res2 = ctrl.execute_step(
+            setpoint=1000.0,    # Discharge
+            soc_actual=res1.SOC,
+            grid_avail=True,
+            p_DC=4000.0,
+            CI_grid=400.0,      # Dirty grid
+            sys_config=cfg,
+            CI_battery_prev=res1.CI_battery
+        )
+        # Battery CI stays roughly same (might shift slightly due to efficiency but mass-balance should hold)
+        self.assertAlmostEqual(res2.CI_battery, res1.CI_battery, places=1, msg="Battery CI should remain stable during discharge")
+        self.assertLess(res2.CI_DC_consumption, 400.0, "DC consumption CI should be lower than grid CI because of clean battery energy")
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -219,21 +219,36 @@ class ChangeManagementLayer:
         p_dch    = [pulp.LpVariable(f"mpc_pdch_{t}", lowBound=0, upBound=sys_config.P_DCH_MAX) for t in range(n)]
         soc_var  = [pulp.LpVariable(f"mpc_soc_{t}",  lowBound=sys_config.SOC_MIN, upBound=sys_config.SOC_MAX) for t in range(n)]
         unserved = [pulp.LpVariable(f"mpc_uns_{t}",  lowBound=0) for t in range(n)]
+        soc_slack = [pulp.LpVariable(f"mpc_soc_slack_{t}", lowBound=0) for t in range(n)]
 
         # Objective — same as Goal Management
+        w_unserved = 1e9
+        w_carbon   = 1.0
+        w_effort   = 0.01
+        w_soc_low  = 1e6
+
         if mode == OperationMode.CARBON_MINIMISE:
-            prob += pulp.lpSum(
-                ci.iloc[t] * (p_dc.iloc[t] + p_ch[t] - p_dch[t]) * dt
-                for t in range(n)
+            # Standard carbon mode — now with penalties to ensure service reliability and recharging
+            prob += (
+                w_unserved * pulp.lpSum(unserved[t] for t in range(n))
+                + w_soc_low * pulp.lpSum(soc_slack[t] for t in range(n))
+                + pulp.lpSum(
+                    # Grid draw: p_DC + p_ch - p_dch - unserved
+                    ci.iloc[t] * (p_dc.iloc[t] + p_ch[t] - p_dch[t] - unserved[t]) * dt
+                    for t in range(n)
+                )
+                + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
             )
         elif mode == OperationMode.NONFIRM:
             prob += (
-                1e6 * pulp.lpSum(unserved[t] for t in range(n))
+                w_unserved * pulp.lpSum(unserved[t] for t in range(n))
+                + w_soc_low * pulp.lpSum(soc_slack[t] for t in range(n))
                 + pulp.lpSum(
-                    # Grid draw: p_DC + p_ch - p_dch
-                    ci.iloc[t] * (p_dc.iloc[t] + p_ch[t] - p_dch[t]) * dt
-                    for t in range(n) if bool(avail.iloc[t])
+                    # Grid draw: p_DC + p_ch - p_dch - unserved
+                    ci.iloc[t] * (p_dc.iloc[t] + p_ch[t] - p_dch[t] - unserved[t]) * dt
+                    for t in range(n)
                 )
+                + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
             )
 
         # Constraints
@@ -249,17 +264,19 @@ class ChangeManagementLayer:
                 prob += p_ch[t] == 0.0
                 prob += p_dch[t] == 0.0
 
-            if mode == OperationMode.NONFIRM and bool(avail.iloc[t]) and sys_config.E_BAT > 0.0:
-                prob += soc_var[t] >= 70.0
+            # Soft SOC target: prefer keeping SOC above a baseline
+            if sys_config.E_BAT > 0.0:
+                soc_baseline = 70.0 if mode == OperationMode.NONFIRM else 50.0
+                prob += soc_var[t] + soc_slack[t] >= soc_baseline
 
+            # Grid limits and balance
+            p_grid_t = p_dc.iloc[t] + p_ch[t] - p_dch[t] - unserved[t]
+            prob += p_grid_t >= 0
+            
             if bool(avail.iloc[t]):
-                prob += p_dc.iloc[t] + p_ch[t] - p_dch[t] >= 0
-                prob += p_dc.iloc[t] + p_ch[t] - p_dch[t] <= sys_config.P_GRID_MAX
-                prob += unserved[t] == 0
+                prob += p_grid_t <= sys_config.P_GRID_MAX
             else:
-                prob += p_ch[t]  == 0
-                prob += p_dch[t] + unserved[t] >= p_dc.iloc[t]
-                prob += p_dch[t] <= p_dc.iloc[t]
+                prob += p_grid_t == 0
 
         # Use a safe CMD solver for background execution to prevent temporary file clashes and blocking.
         solver = pulp.PULP_CBC_CMD(msg=0, threads=1, keepFiles=False)

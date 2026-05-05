@@ -145,26 +145,42 @@ class GoalManagementLayer:
         p_dch   = [pulp.LpVariable(f"p_dch_{t}",   lowBound=0, upBound=sys_config.P_DCH_MAX) for t in range(n)]
         soc     = [pulp.LpVariable(f"soc_{t}",     lowBound=sys_config.SOC_MIN, upBound=sys_config.SOC_MAX) for t in range(n)]
         unserved= [pulp.LpVariable(f"unserved_{t}", lowBound=0) for t in range(n)]
+        soc_slack = [pulp.LpVariable(f"soc_slack_{t}", lowBound=0) for t in range(n)]
+
+        # ── Objective ─────────────────────────────────────────────────────────
+        # Priority 1: Minimise unserved load (Reliability)
+        # Priority 2: Keep SOC at target (Recharge battery when possible)
+        # Priority 3: Minimise carbon
+        # Priority 4: Minimise battery "effort" (reduces jumping/oscillation)
+        
+        w_unserved = 1e9   # Huge penalty for unserved load (backup service)
+        w_carbon   = 1.0
+        w_effort   = 0.01  # Small penalty to avoid violent oscillations
+        w_soc_low  = 1e6   # Heavy penalty for dropping below target SOC (forces recharge)
 
         if goals.mode == OperationMode.CARBON_MINIMISE:
-            # Minimise total Scope 2 CO2
-            prob += pulp.lpSum(
-                goals.CI_grid.iloc[t] * (goals.p_DC.iloc[t] + p_ch[t] - p_dch[t]) * dt
-                for t in range(n)
+            # Standard carbon mode — now with penalties to ensure service reliability and recharging
+            prob += (
+                w_unserved * pulp.lpSum(unserved[t] for t in range(n))
+                + w_soc_low * pulp.lpSum(soc_slack[t] for t in range(n))
+                + pulp.lpSum(
+                    # Grid draw: p_DC + p_ch - p_dch - unserved
+                    goals.CI_grid.iloc[t] * (goals.p_DC.iloc[t] + p_ch[t] - p_dch[t] - unserved[t]) * dt
+                    for t in range(n)
+                )
+                + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
             )
 
         elif goals.mode == OperationMode.NONFIRM:
-            # Minimise unserved DC load during outages
-            # Secondary: minimise carbon when grid is available
-            w_unserved = 1e6   # heavy penalty for unserved load
-            w_carbon   = 1.0
             prob += (
                 w_unserved * pulp.lpSum(unserved[t] for t in range(n))
+                + w_soc_low  * pulp.lpSum(soc_slack[t] for t in range(n))
                 + w_carbon   * pulp.lpSum(
-                    # Grid draw: p_DC + p_ch - p_dch
-                    goals.CI_grid.iloc[t] * (goals.p_DC.iloc[t] + p_ch[t] - p_dch[t]) * dt
-                    for t in range(n) if goals.grid_available.iloc[t]
+                    # Grid draw: p_DC + p_ch - p_dch - unserved
+                    goals.CI_grid.iloc[t] * (goals.p_DC.iloc[t] + p_ch[t] - p_dch[t] - unserved[t]) * dt
+                    for t in range(n)
                 )
+                + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
             )
 
         # ── Constraints ───────────────────────────────────────────────────────
@@ -188,21 +204,21 @@ class GoalManagementLayer:
                 prob += p_ch[t] == 0.0
                 prob += p_dch[t] == 0.0
 
-            # Extra SOC floor in NONFIRM mode: keep SOC high whenever grid is available
-            if goals.mode == OperationMode.NONFIRM and avail and sys_config.E_BAT > 0.0:
-                prob += soc[t] >= 70.0
+            # Soft SOC target: prefer keeping SOC above a baseline (e.g. 50% in carbon mode, 70% in nonfirm)
+            if sys_config.E_BAT > 0.0:
+                soc_baseline = 70.0 if goals.mode == OperationMode.NONFIRM else 50.0
+                prob += soc[t] + soc_slack[t] >= soc_baseline
 
-            # Grid availability
+            # Grid limits and balance
+            # Grid draw = p_dc_t + p_ch[t] - p_dch[t] - unserved[t]
+            p_grid_t = p_dc_t + p_ch[t] - p_dch[t] - unserved[t]
+            prob += p_grid_t >= 0
+            
             if avail:
-                # Grid draw must be non-negative and within limit
-                prob += p_dc_t + p_ch[t] - p_dch[t] >= 0
-                prob += p_dc_t + p_ch[t] - p_dch[t] <= sys_config.P_GRID_MAX
-                prob += unserved[t] == 0
+                prob += p_grid_t <= sys_config.P_GRID_MAX
             else:
-                # No grid — battery must cover DC load
-                prob += p_ch[t]  == 0
-                prob += p_dch[t] + unserved[t] >= p_dc_t
-                prob += p_dch[t] <= p_dc_t      # don't discharge more than needed
+                prob += p_grid_t == 0
+
 
         # End-of-day SOC target (soft: within ±10%)
         prob += soc[n - 1] >= goals.SOC_target_end - 10.0

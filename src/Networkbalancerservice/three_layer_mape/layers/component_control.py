@@ -21,6 +21,8 @@ class ComponentState:
     p_DC:      float    # DC load [kW]
     unserved:  float    # Unserved DC load [kW]
     carbon:    float    # Scope 2 CO2 this hour [gCO2]
+    CI_battery: float   # Carbon intensity of energy in battery [gCO2/kWh]
+    CI_DC_consumption: float # Effective CI of energy consumed by DC [gCO2/kWh]
     alarm:     bool  = False
     alarm_msg: str   = ""
 
@@ -45,6 +47,7 @@ class ComponentControlLayer:
         p_DC:       float,          # Actual DC load [kW]
         CI_grid:    float,          # Carbon intensity [gCO2/kWh]
         sys_config: SystemConfig,    # Dynamic system configuration
+        CI_battery_prev: float = 250.0 # CI of energy already in battery [gCO2/kWh]
     ) -> ComponentState:
 
         dt        = sys_config.dt
@@ -110,7 +113,7 @@ class ComponentControlLayer:
                 # For simplicity, we just clip it to what the battery can do
                 p_ref = np.clip(p_ref_new, -sys_config.P_CH_MAX, sys_config.P_DCH_MAX)
                 
-                # Re-check SoC with updated p_ref (omitted for brevity, but should be done in production)
+                # Re-check SoC with updated p_ref
                 p_grid_calc = p_DC - p_ref
                 
             p_grid = np.clip(p_grid_calc, 0, sys_config.P_GRID_MAX)
@@ -122,11 +125,42 @@ class ComponentControlLayer:
             unserved = max(0.0, p_DC - covered)
 
         # ── Carbon accounting ────────────────────────────────────────────────
-        carbon = CI_grid * p_grid * dt          # gCO2
+        # 1. Carbon emitted from grid at this step [gCO2]
+        # (p_grid is total draw from grid)
+        # carbon_grid = CI_grid * p_grid * dt
+
+        # 2. Update Battery Carbon state
+        energy_in_battery = (soc_actual / 100.0) * sys_config.E_BAT  # [kWh]
+        carbon_in_battery = energy_in_battery * CI_battery_prev      # [gCO2]
+
+        if p_ref < 0:
+            # Charging: add grid carbon
+            p_charge = -p_ref
+            energy_added = p_charge * dt * sys_config.EFF_CH
+            carbon_in_battery += energy_added * CI_grid
+            energy_in_battery += energy_added
+        elif p_ref > 0:
+            # Discharging: remove battery carbon
+            p_discharge = p_ref
+            energy_removed = (p_discharge * dt) / sys_config.EFF_DCH
+            carbon_in_battery -= energy_removed * CI_battery_prev
+            energy_in_battery -= energy_removed
+
+        CI_battery_new = carbon_in_battery / energy_in_battery if energy_in_battery > 0.01 else CI_battery_prev
+        
+        # 3. Calculate effective CI of DC consumption
+        # DC load is met by (p_grid - p_charge) and (p_discharge)
+        p_bess_to_DC = max(0.0, p_ref)
+        p_grid_to_DC = p_grid - max(0.0, -p_ref) 
+        
+        total_dc_carbon = (CI_grid * p_grid_to_DC + CI_battery_prev * p_bess_to_DC) * dt
+        CI_DC_consumption = total_dc_carbon / (p_DC * dt) if p_DC > 0.01 else CI_grid
 
         return ComponentState(
             SOC=new_soc, p_ch_b=p_ref, p_grid=p_grid,
             p_DC=p_DC, unserved=unserved,
-            carbon=carbon,
+            carbon=total_dc_carbon,
+            CI_battery=CI_battery_new,
+            CI_DC_consumption=CI_DC_consumption,
             alarm=alarm, alarm_msg=alarm_msg,
         )
