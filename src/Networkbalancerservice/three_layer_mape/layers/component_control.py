@@ -47,7 +47,8 @@ class ComponentControlLayer:
         p_DC:       float,          # Actual DC load [kW]
         CI_grid:    float,          # Carbon intensity [gCO2/kWh]
         sys_config: SystemConfig,    # Dynamic system configuration
-        CI_battery_prev: float = 250.0 # CI of energy already in battery [gCO2/kWh]
+        CI_battery_prev: float = 250.0, # CI of energy already in battery [gCO2/kWh]
+        p_PV:       float = 0.0     # Actual PV generation [kW]
     ) -> ComponentState:
 
         dt        = sys_config.dt
@@ -55,11 +56,11 @@ class ComponentControlLayer:
         alarm_msg = ""
         p_ref     = setpoint # + discharge / - charge
 
-        # ── Override: if grid unexpectedly down, discharge to cover DC load ──
+        # ── Override: if grid unexpectedly down, discharge to cover net DC load ──
         if not grid_avail:
-            p_ref     = min(sys_config.P_DCH_MAX, p_DC)
+            p_ref     = np.clip(p_DC - p_PV, -sys_config.P_CH_MAX, sys_config.P_DCH_MAX)
             alarm     = True
-            alarm_msg = "Unplanned grid outage — emergency discharge"
+            alarm_msg = "Unplanned grid outage — emergency islanding"
 
         # ── Hard power clamp ─────────────────────────────────────────────────
         p_ref = np.clip(p_ref, -sys_config.P_CH_MAX, sys_config.P_DCH_MAX)
@@ -97,62 +98,61 @@ class ComponentControlLayer:
             new_soc = 0.0
 
         # ── Energy balance ───────────────────────────────────────────────────
-        # Grid draw = DC load + Battery charging (-p_ref if p_ref < 0) - Battery discharging (p_ref if p_ref > 0)
-        # So p_grid = p_DC - p_ref
+        # Grid draw = DC load - PV generation + Battery charging (-p_ref if p_ref < 0) - Battery discharging (p_ref if p_ref > 0)
+        # So p_grid = p_DC - p_PV - p_ref
         if grid_avail:
-            p_grid_calc = p_DC - p_ref
+            p_grid_calc = p_DC - p_PV - p_ref
             
             # If grid limit hit, we must first reduce charging (if any), then discharge more (if possible), then shed load.
             if p_grid_calc > sys_config.P_GRID_MAX:
-                # 1. Reduce charging or increase discharge to stay within grid limit
-                # We need p_grid = p_DC - p_ref_new <= P_GRID_MAX
-                # So p_ref_new >= p_DC - P_GRID_MAX
-                p_ref_new = max(p_ref, p_DC - sys_config.P_GRID_MAX)
-                
-                # Check if new p_ref is physically possible (P_DCH_MAX and SOC_MIN)
-                # For simplicity, we just clip it to what the battery can do
+                # We need p_grid = p_DC - p_PV - p_ref_new <= P_GRID_MAX
+                # So p_ref_new >= p_DC - p_PV - P_GRID_MAX
+                p_ref_new = max(p_ref, p_DC - p_PV - sys_config.P_GRID_MAX)
                 p_ref = np.clip(p_ref_new, -sys_config.P_CH_MAX, sys_config.P_DCH_MAX)
-                
-                # Re-check SoC with updated p_ref
-                p_grid_calc = p_DC - p_ref
+                p_grid_calc = p_DC - p_PV - p_ref
                 
             p_grid = np.clip(p_grid_calc, 0, sys_config.P_GRID_MAX)
-            unserved = max(0.0, p_DC - p_ref - sys_config.P_GRID_MAX)
+            unserved = max(0.0, p_DC - p_PV - p_ref - sys_config.P_GRID_MAX)
         else:
             p_grid   = 0.0
-            # Grid down: p_ref is discharge. DC load covered by p_ref.
-            covered  = max(0.0, p_ref) if p_ref > 0 else 0.0
+            # Grid down: PV and battery must cover DC
+            covered  = p_PV + max(0.0, p_ref)
             unserved = max(0.0, p_DC - covered)
 
         # ── Carbon accounting ────────────────────────────────────────────────
-        # 1. Carbon emitted from grid at this step [gCO2]
-        # (p_grid is total draw from grid)
-        # carbon_grid = CI_grid * p_grid * dt
-
-        # 2. Update Battery Carbon state
         energy_in_battery = (soc_actual / 100.0) * sys_config.E_BAT  # [kWh]
         carbon_in_battery = energy_in_battery * CI_battery_prev      # [gCO2]
 
         if p_ref < 0:
-            # Charging: add grid carbon
+            # Charging: figure out if grid or PV is providing the charge
             p_charge = -p_ref
+            p_PV_to_DC = min(p_DC, p_PV)
+            p_PV_excess = max(0.0, p_PV - p_DC)
+            p_PV_to_BESS = min(p_charge, p_PV_excess)
+            p_grid_to_BESS = max(0.0, p_charge - p_PV_to_BESS)
+            
             energy_added = p_charge * dt * sys_config.EFF_CH
-            carbon_in_battery += energy_added * CI_grid
+            # Zero carbon for PV part, grid carbon for grid part
+            carbon_added = (p_grid_to_BESS * CI_grid + p_PV_to_BESS * 0.0) * dt * sys_config.EFF_CH
+            
+            carbon_in_battery += carbon_added
             energy_in_battery += energy_added
-        elif p_ref > 0:
+            
+            p_grid_to_DC = max(0.0, p_grid - p_grid_to_BESS)
+            p_bess_to_DC = 0.0
+        else:
             # Discharging: remove battery carbon
             p_discharge = p_ref
             energy_removed = (p_discharge * dt) / sys_config.EFF_DCH
             carbon_in_battery -= energy_removed * CI_battery_prev
             energy_in_battery -= energy_removed
+            
+            p_grid_to_DC = p_grid
+            p_bess_to_DC = p_discharge
 
         CI_battery_new = carbon_in_battery / energy_in_battery if energy_in_battery > 0.01 else CI_battery_prev
         
-        # 3. Calculate effective CI of DC consumption
-        # DC load is met by (p_grid - p_charge) and (p_discharge)
-        p_bess_to_DC = max(0.0, p_ref)
-        p_grid_to_DC = p_grid - max(0.0, -p_ref) 
-        
+        # Calculate effective CI of DC consumption
         total_dc_carbon = (CI_grid * p_grid_to_DC + CI_battery_prev * p_bess_to_DC) * dt
         CI_DC_consumption = total_dc_carbon / (p_DC * dt) if p_DC > 0.01 else CI_grid
 

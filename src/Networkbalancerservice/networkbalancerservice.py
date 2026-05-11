@@ -55,10 +55,10 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self._shadow_subs = {}  # HELICS inputs registered outside framework tracking
 
 
-        # ── Forecast error model (calibrated Gaussian perturbation) ───────────
+        # ── Forecast error model ───────────────────────────────
         self._forecast_error = ForecastErrorModel()
 
-        # ── Custom Calculation Setup ──────────────────────────────────────────
+        # ── Custom Calculation Setup ─────────────────────────────
         da_info = HelicsCalculationInformation(
             time_period_in_seconds=86400,
             offset=2,
@@ -84,9 +84,11 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             "bess":      ("Battery",           "bess_power_w",               "W"),
             "limit":     ("PowerPlant",        "actual_power_limit_ID",      "W"),
             "ci":        ("PowerPlant",        "actual_carbon_intensity_ID", "gCO2/kWh"),
-            "da_limit":  ("PowerPlant",        "power_limit_plan_DA",        "JSON"),
-            "da_ci":     ("PowerPlant",        "carbon_intensity_plan_DA",   "JSON"),
-            "da_demand": ("ElectricityDemand", "demand_power_plan_DA",       "JSON"),
+            "da_limit":  ("PowerPlant",        "power_limit_plan_DA",        ""),
+            "da_ci":     ("PowerPlant",        "carbon_intensity_plan_DA",   ""),
+            "da_demand": ("ElectricityDemand", "demand_power_plan_DA",       ""),
+            "pv":        ("PVInstallation",    "potential_available_generation_ID", "W"),
+            "da_pv":     ("PVInstallation",    "planned_generation_DA",      ""), 
         }
         dispatch_outputs = [
             PublicationDescription(global_flag=True, esdl_type="ElectricityNetwork", output_name="bess_allocation_w", output_unit="W", data_type=h.HelicsDataType.DOUBLE),
@@ -212,12 +214,15 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             raw_limit = None
             raw_ci = None
             raw_demand = None
+            raw_pv = None
             
             for _ in range(50):
                 if not raw_limit: raw_limit = self._read_shadow_string("da_limit")
                 if not raw_ci: raw_ci = self._read_shadow_string("da_ci")
                 if not raw_demand: raw_demand = self._read_shadow_string("da_demand")
+                if not raw_pv: raw_pv = self._read_shadow_string("da_pv")
                 if raw_limit and raw_ci and raw_demand:
+                    # PV is optional, if we get it earlier, great, but we shouldn't fail if absent
                     break
                 time.sleep(0.1)
 
@@ -257,27 +262,33 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                     for i in range(n)
                 ]
 
+            pv_actual = self._parse_json_list(raw_pv, 0.0)
+
             forecast = {
                 "CI_grid":        self._forecast_error.perturb("CI_grid",  pd.Series(ci_actual)),
                 "grid_available": pd.Series([(v > 0) for v in grid_limits_kw]),
                 "p_DC":           self._forecast_error.perturb("p_DC",     pd.Series(dc_demand_actual)),
+                "p_PV":           pd.Series(pv_actual),
             }
 
             LOGGER.info(
-                "[DA Forecast] t=%s  n=%d steps  CI_mean=%.0f gCO2/kWh  p_DC_mean=%.0f kW",
+                "[DA Forecast] t=%s  n=%d steps  CI_mean=%.0f gCO2/kWh  p_DC_mean=%.0f kW  p_PV_mean=%.0f kW",
                 simulation_time.isoformat(), n,
                 float(forecast["CI_grid"].mean()),
                 float(forecast["p_DC"].mean()),
+                float(forecast["p_PV"].mean())
             )
 
             goals, plan = self.goal_layer.execute(forecast, self.sys_config, soc_init=self.current_soc)
             self._pending_da_result = (goals, plan)
 
             # ── LOG Full Future DA Plan ──────────────────────────────────────
-            # We log the plan as a series of future points and as a full JSON array.
+            # FIX: Subtract the 2s offset to get clean timestamps at the 15-min marks
+            clean_start_time = simulation_time - timedelta(seconds=2)
+            
             p_bess_json, soc_json = [], []
             for i in range(len(plan.p_ch_b)):
-                future_time = simulation_time + timedelta(seconds=900 * i)
+                future_time = clean_start_time + timedelta(seconds=900 * i)
                 ts = future_time.isoformat()
                 
                 val_soc = float(plan.SOC_plan.iloc[i])
@@ -291,11 +302,11 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                 soc_json.append({"time": ts, "value": round(val_soc, 2)})
                 p_bess_json.append({"time": ts, "value": round(val_p, 1)})
 
-            # Log full JSON plans at the current simulation time (matching Powerplant service style)
-            self.influx_connector.set_time_step_data_point(esdl_id, "bess_power_plan_DA", simulation_time, json.dumps(p_bess_json))
-            self.influx_connector.set_time_step_data_point(esdl_id, "soc_plan_DA",        simulation_time, json.dumps(soc_json))
+            # Log full JSON plans at the current simulation time (corrected)
+            self.influx_connector.set_time_step_data_point(esdl_id, "bess_power_plan_DA", clean_start_time, json.dumps(p_bess_json))
+            self.influx_connector.set_time_step_data_point(esdl_id, "soc_plan_DA",        clean_start_time, json.dumps(soc_json))
 
-            LOGGER.info(f"[DA thread] Plan generated and logged (Points + JSON).")
+            LOGGER.info(f"[DA thread] Plan generated and logged for T={clean_start_time.isoformat()}.")
         except Exception as exc:
             LOGGER.error(f"[DA thread] Failed: {exc}")
 
@@ -339,14 +350,16 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
     def day_ahead_routing(self, param_dict, simulation_time, time_step_number, esdl_id, energy_system):
         self._refresh_system_params(energy_system)
         self.current_day_step_idx = 0
-        threading.Thread(target=self._run_day_ahead_lp, args=(simulation_time, esdl_id), daemon=True).start()
+        LOGGER.info(f"[{simulation_time}] Running day-ahead LP synchronously.")
+        self._run_day_ahead_lp(simulation_time, esdl_id)
         return {}
 
     def network_dispatch(self, param_dict, simulation_time, time_step_number, esdl_id, energy_system):
-        if self._pending_da_result:
+        if self._pending_da_result is not None:
             goals, plan = self._pending_da_result
             self._pending_da_result = None
             self.change_layer.load_day_ahead_plan(goals, plan)
+            self.current_day_step_idx = 0 # Ensure strict alignment when loading new plan
 
         try:
             return self._do_network_dispatch(param_dict, simulation_time, time_step_number, esdl_id, energy_system)
@@ -379,6 +392,9 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             return None
 
     def _do_network_dispatch(self, param_dict, simulation_time, time_step_number, esdl_id, energy_system):
+        # FIX: Subtract the 10s offset to get clean timestamps at the 15-min marks
+        clean_time = simulation_time - timedelta(seconds=10)
+
         # ── 1. READ inputs ──
         # demand_power_w: formal framework input (blocking wait handled by framework)
         demand_w = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "demand_power_w")
@@ -400,6 +416,10 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         ci_val = self._read_shadow_sub("ci")
         if ci_val is not None:
             self._state_cache["actual_carbon_intensity_ID"] = ci_val
+
+        # PV generation: shadow subscription (non-blocking)
+        pv_val = self._read_shadow_sub("pv")
+        pv_kw = (pv_val / 1000.0) if pv_val is not None else 0.0
 
         limit_w      = self._state_cache["actual_power_limit_ID"]
         ci_val       = self._state_cache["actual_carbon_intensity_ID"]
@@ -434,23 +454,23 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                 forecast_grid_avail = bool(self.change_layer.goals.grid_available.iloc[step])
 
             # Trigger MPC Replanning if needed
-            if event.triggered_replan and not self._mpc_running:
-                self._mpc_running = True
-                threading.Thread(target=self._run_mpc_replan, args=(event, simulation_time, esdl_id), daemon=True).start()
+            if event.triggered_replan:
+                LOGGER.info(f"[{simulation_time}] Running MPC replan synchronously.")
+                self._run_mpc_replan(event, simulation_time, esdl_id)
             
             # Setpoint extraction
             raw_setpoint = self.change_layer.plan.p_ch_b.iloc[step]
             if raw_setpoint is None or (isinstance(raw_setpoint, float) and math.isnan(raw_setpoint)):
                 LOGGER.warning("Plan setpoint is NaN/None at step %d, using heuristic", step)
-                setpoint_kw = self._heuristic_fallback(soc_actual, limit_w, demand_w)
+                setpoint_kw = self._heuristic_fallback(soc_actual, limit_w, demand_w, pv_kw)
             else:
                 setpoint_kw = float(raw_setpoint)
         else:
             # Heuristic fallback uses (+ discharge / - charge) convention
-            setpoint_kw = self._heuristic_fallback(soc_actual, limit_w, demand_w)
+            setpoint_kw = self._heuristic_fallback(soc_actual, limit_w, demand_w, pv_kw)
 
         # ── 3. EXECUTION ──
-        exec_state = self.control_layer.execute_step(setpoint_kw, soc_actual, grid_available, p_dc_kw, ci_val, self.sys_config, CI_battery_prev=self.current_ci_battery)
+        exec_state = self.control_layer.execute_step(setpoint_kw, soc_actual, grid_available, p_dc_kw, ci_val, self.sys_config, CI_battery_prev=self.current_ci_battery, p_PV=pv_kw)
         
         self.current_day_step_idx += 1
         self.current_ci_battery = exec_state.CI_battery
@@ -463,37 +483,38 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         # ── 4. COMPREHENSIVE LOGGING ──
         
         # Real-time Execution States
-        self.influx_connector.set_time_step_data_point(esdl_id, "Actual_SOC_from_Battery", simulation_time, soc_actual)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Setpoint_from_Layers_kW", simulation_time, setpoint_kw)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Grid_Available", simulation_time, 1.0 if grid_available else 0.0)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Carbon_Intensity", simulation_time, ci_val)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_Grid_W", simulation_time, grid_w)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_BESS_W", simulation_time, bess_w)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Requested_Power_W", simulation_time, backup_w)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Total_Routed_Demand_W", simulation_time, demand_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Actual_SOC_from_Battery", clean_time, soc_actual)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Setpoint_from_Layers_kW", clean_time, setpoint_kw)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Grid_Available", clean_time, 1.0 if grid_available else 0.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Carbon_Intensity", clean_time, ci_val)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_Grid_W", clean_time, grid_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_BESS_W", clean_time, bess_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Requested_Power_W", clean_time, backup_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Total_Routed_Demand_W", clean_time, demand_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "PV_Generation_W", clean_time, pv_kw * 1000.0)
         
         # Carbon Metrics
-        self.influx_connector.set_time_step_data_point(esdl_id, "Total_Carbon_g", simulation_time, exec_state.carbon)
-        self.influx_connector.set_time_step_data_point(esdl_id, "CI_DC_Consumption_gCO2_kWh", simulation_time, exec_state.CI_DC_consumption)
-        self.influx_connector.set_time_step_data_point(esdl_id, "CI_Battery_gCO2_kWh", simulation_time, exec_state.CI_battery)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Total_Carbon_g", clean_time, exec_state.carbon)
+        self.influx_connector.set_time_step_data_point(esdl_id, "CI_DC_Consumption_gCO2_kWh", clean_time, exec_state.CI_DC_consumption)
+        self.influx_connector.set_time_step_data_point(esdl_id, "CI_Battery_gCO2_kWh", clean_time, exec_state.CI_battery)
 
         # Plan Comparisons (Current Step)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Planned_SOC", simulation_time, planned_soc)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Planned_BESS_Power_W", simulation_time, planned_bess_kw * 1000.0)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Forecasted_Grid_CI", simulation_time, forecast_ci)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Forecasted_Grid_Available", simulation_time, 1.0 if forecast_grid_avail else 0.0)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Forecasted_DC_Demand_W", simulation_time, forecast_p_dc_kw * 1000.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Planned_SOC", clean_time, planned_soc)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Planned_BESS_Power_W", clean_time, planned_bess_kw * 1000.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Forecasted_Grid_CI", clean_time, forecast_ci)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Forecasted_Grid_Available", clean_time, 1.0 if forecast_grid_avail else 0.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Forecasted_DC_Demand_W", clean_time, forecast_p_dc_kw * 1000.0)
 
         # Diagnostic Flags & Deviations
         if event:
-            self.influx_connector.set_time_step_data_point(esdl_id, "SOC_Drift_pct", simulation_time, event.soc_drift)
-            self.influx_connector.set_time_step_data_point(esdl_id, "Demand_Delta_W", simulation_time, event.demand_delta * 1000.0)
-            self.influx_connector.set_time_step_data_point(esdl_id, "Unplanned_Outage_Flag", simulation_time, 1.0 if event.unplanned_outage else 0.0)
-            self.influx_connector.set_time_step_data_point(esdl_id, "Demand_Spike_Flag", simulation_time, 1.0 if event.demand_spike else 0.0)
-            self.influx_connector.set_time_step_data_point(esdl_id, "Triggered_Replan_Flag", simulation_time, 1.0 if event.triggered_replan else 0.0)
+            self.influx_connector.set_time_step_data_point(esdl_id, "SOC_Drift_pct", clean_time, event.soc_drift)
+            self.influx_connector.set_time_step_data_point(esdl_id, "Demand_Delta_W", clean_time, event.demand_delta * 1000.0)
+            self.influx_connector.set_time_step_data_point(esdl_id, "Unplanned_Outage_Flag", clean_time, 1.0 if event.unplanned_outage else 0.0)
+            self.influx_connector.set_time_step_data_point(esdl_id, "Demand_Spike_Flag", clean_time, 1.0 if event.demand_spike else 0.0)
+            self.influx_connector.set_time_step_data_point(esdl_id, "Triggered_Replan_Flag", clean_time, 1.0 if event.triggered_replan else 0.0)
         
-        self.influx_connector.set_time_step_data_point(esdl_id, "MPC_Running_Flag", simulation_time, 1.0 if self._mpc_running else 0.0)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Alarm_Active_Flag", simulation_time, 1.0 if exec_state.alarm else 0.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "MPC_Running_Flag", clean_time, 1.0 if self._mpc_running else 0.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Alarm_Active_Flag", clean_time, 1.0 if exec_state.alarm else 0.0)
 
         return NetworkDispatchOutput(
             bess_allocation_w=bess_w,
@@ -533,17 +554,22 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             data = json.loads(raw)
             if isinstance(data, list):
                 return [float(x.get("value", x))/1000.0 if isinstance(x, dict) else float(x)/1000.0 for x in data]
+            elif isinstance(data, dict) and "generation_w" in data:
+                return [float(x)/1000.0 for x in data["generation_w"]]
             return [float(data)/1000.0] * 96
         except: return [default_kw] * 96
 
-    def _heuristic_fallback(self, soc, limit_w, demand_w):
+    def _heuristic_fallback(self, soc, limit_w, demand_w, pv_kw):
         # Convention: + discharge / - charge
-        if limit_w > demand_w and soc < 95.0:
+        net_demand_kw = max(0.0, demand_w / 1000.0 - pv_kw)
+        limit_kw = limit_w / 1000.0
+        
+        if limit_kw > net_demand_kw and soc < 95.0:
             # Grid surplus: charge battery (negative)
-            return -min(self.sys_config.P_CH_MAX, (limit_w - demand_w)/1000.0)
-        elif limit_w < demand_w and soc > 5.0:
+            return -min(self.sys_config.P_CH_MAX, limit_kw - net_demand_kw)
+        elif limit_kw < net_demand_kw and soc > 5.0:
             # Grid deficit: discharge battery (positive)
-            return min(self.sys_config.P_DCH_MAX, (demand_w - limit_w)/1000.0)
+            return min(self.sys_config.P_DCH_MAX, net_demand_kw - limit_kw)
         return 0.0
 
 if __name__ == "__main__":
@@ -555,3 +581,4 @@ if __name__ == "__main__":
         raise
     finally:
         executor.stop_simulation()
+

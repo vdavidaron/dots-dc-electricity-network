@@ -194,6 +194,7 @@ class ChangeManagementLayer:
         T_mpc   = self.goals.p_DC.index[hour: hour + horizon]
         ci      = self.goals.CI_grid.iloc[hour: hour + horizon]
         avail   = self.goals.grid_available.iloc[hour: hour + horizon]
+        pv      = self.goals.p_PV.iloc[hour: hour + horizon] if self.goals.p_PV is not None else pd.Series([0.0]*horizon, index=T_mpc)
         mode    = self.goals.mode
 
         # If a demand spike was detected, patch the forecast for the MPC horizon
@@ -217,6 +218,7 @@ class ChangeManagementLayer:
 
         p_ch     = [pulp.LpVariable(f"mpc_pch_{t}",  lowBound=0, upBound=sys_config.P_CH_MAX)  for t in range(n)]
         p_dch    = [pulp.LpVariable(f"mpc_pdch_{t}", lowBound=0, upBound=sys_config.P_DCH_MAX) for t in range(n)]
+        p_grid   = [pulp.LpVariable(f"mpc_pgrid_{t}", lowBound=0, upBound=sys_config.P_GRID_MAX) for t in range(n)]
         soc_var  = [pulp.LpVariable(f"mpc_soc_{t}",  lowBound=sys_config.SOC_MIN, upBound=sys_config.SOC_MAX) for t in range(n)]
         unserved = [pulp.LpVariable(f"mpc_uns_{t}",  lowBound=0) for t in range(n)]
         soc_slack = [pulp.LpVariable(f"mpc_soc_slack_{t}", lowBound=0) for t in range(n)]
@@ -228,13 +230,11 @@ class ChangeManagementLayer:
         w_soc_low  = 1e6
 
         if mode == OperationMode.CARBON_MINIMISE:
-            # Standard carbon mode — now with penalties to ensure service reliability and recharging
             prob += (
                 w_unserved * pulp.lpSum(unserved[t] for t in range(n))
                 + w_soc_low * pulp.lpSum(soc_slack[t] for t in range(n))
                 + pulp.lpSum(
-                    # Grid draw: p_DC + p_ch - p_dch - unserved
-                    ci.iloc[t] * (p_dc.iloc[t] + p_ch[t] - p_dch[t] - unserved[t]) * dt
+                    ci.iloc[t] * p_grid[t] * dt
                     for t in range(n)
                 )
                 + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
@@ -243,9 +243,8 @@ class ChangeManagementLayer:
             prob += (
                 w_unserved * pulp.lpSum(unserved[t] for t in range(n))
                 + w_soc_low * pulp.lpSum(soc_slack[t] for t in range(n))
-                + pulp.lpSum(
-                    # Grid draw: p_DC + p_ch - p_dch - unserved
-                    ci.iloc[t] * (p_dc.iloc[t] + p_ch[t] - p_dch[t] - unserved[t]) * dt
+                + w_carbon * pulp.lpSum(
+                    ci.iloc[t] * p_grid[t] * dt
                     for t in range(n)
                 )
                 + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
@@ -254,6 +253,9 @@ class ChangeManagementLayer:
         # Constraints
         for t in range(n):
             soc_prev = soc_init if t == 0 else soc_var[t - 1]
+            p_dc_t = p_dc.iloc[t]
+            p_pv_t = pv.iloc[t]
+            
             if sys_config.E_BAT > 0.0:
                 prob += soc_var[t] == soc_prev + (
                     (sys_config.EFF_CH * p_ch[t] * dt / sys_config.E_BAT) * 100.0
@@ -270,13 +272,10 @@ class ChangeManagementLayer:
                 prob += soc_var[t] + soc_slack[t] >= soc_baseline
 
             # Grid limits and balance
-            p_grid_t = p_dc.iloc[t] + p_ch[t] - p_dch[t] - unserved[t]
-            prob += p_grid_t >= 0
+            prob += p_grid[t] >= p_dc_t - p_pv_t + p_ch[t] - p_dch[t] - unserved[t]
             
-            if bool(avail.iloc[t]):
-                prob += p_grid_t <= sys_config.P_GRID_MAX
-            else:
-                prob += p_grid_t == 0
+            if not bool(avail.iloc[t]):
+                prob += p_grid[t] == 0
 
         # Use a safe CMD solver for background execution to prevent temporary file clashes and blocking.
         solver = pulp.PULP_CBC_CMD(msg=0, threads=1, keepFiles=False)

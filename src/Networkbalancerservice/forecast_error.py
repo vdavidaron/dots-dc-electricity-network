@@ -125,27 +125,27 @@ class ForecastErrorModel:
             Perturbed forecast with the same index as *actual*.
         """
         # FOR TESTING: Disable forecast error so DA and ID are identical
-        return pd.Series(actual) if not isinstance(actual, pd.Series) else actual.copy()
+        # return pd.Series(actual) if not isinstance(actual, pd.Series) else actual.copy()
 
-        # s = pd.Series(actual) if not isinstance(actual, pd.Series) else actual.copy()
-        # sigma = self._sigma.get(signal_name, 0.0)
+        s = pd.Series(actual) if not isinstance(actual, pd.Series) else actual.copy()
+        sigma = self._sigma.get(signal_name, 0.0)
 
-        # if sigma > 0.0:
-        #     n = len(s)
-        #     noise = self._rng.normal(loc=0.0, scale=sigma, size=n)
-        #     s = s * (1.0 + noise)
+        if sigma > 0.0:
+            n = len(s)
+            noise = self._rng.normal(loc=0.0, scale=sigma, size=n)
+            s = s * (1.0 + noise)
 
-        # lb = _LOWER_BOUND.get(signal_name, 0.0)
-        # s = s.clip(lower=lb)
+        lb = _LOWER_BOUND.get(signal_name, 0.0)
+        s = s.clip(lower=lb)
 
-        # if sigma > 0.0:
-        #     mae = float((s - pd.Series(actual)).abs().mean())
-        #     LOGGER.debug(
-        #         "[ForecastError] %s — σ=%.0f%%  MAE=%.3f  mean(actual)=%.3f",
-        #         signal_name, sigma * 100, mae, float(pd.Series(actual).mean()),
-        #     )
+        if sigma > 0.0:
+            mae = float((s - pd.Series(actual)).abs().mean())
+            LOGGER.debug(
+                 "[ForecastError] %s — σ=%.0f%%  MAE=%.3f  mean(actual)=%.3f",
+                 signal_name, sigma * 100, mae, float(pd.Series(actual).mean()),
+             )
 
-        # return s
+        return s
 
     def perturb_scalar(self, signal_name: str, actual: float) -> float:
         """Convenience wrapper for a single scalar value."""

@@ -47,6 +47,7 @@ class Goals:
     CI_grid:        pd.Series       # 24h carbon intensity [gCO2/kWh]
     grid_available: pd.Series       # 24h grid availability [bool]
     p_DC:           pd.Series       # 24h DC load forecast  [kW]
+    p_PV:           Optional[pd.Series] = None # 24h PV forecast [kW]
 
 
 @dataclass
@@ -65,7 +66,6 @@ class GoalManagementLayer:
 
     Scenarios
     ---------
-    cost    → minimise total electricity cost
     carbon  → minimise total Scope 2 CO2 emissions
     nonfirm → minimise unserved load during grid outages (feasibility first)
     """
@@ -96,6 +96,7 @@ class GoalManagementLayer:
         CI_grid        = forecast["CI_grid"]
         grid_available = forecast["grid_available"]
         p_DC           = forecast["p_DC"]
+        p_PV           = forecast.get("p_PV", pd.Series([0.0]*len(p_DC), index=p_DC.index))
 
         mode_map = {
             "carbon":  OperationMode.CARBON_MINIMISE,
@@ -105,7 +106,7 @@ class GoalManagementLayer:
 
         if mode == OperationMode.NONFIRM:
             outage_hours  = int((~grid_available).sum())
-            energy_needed = p_DC.mean() * outage_hours          # kWh
+            energy_needed = max(0, (p_DC - p_PV).mean()) * outage_hours          # kWh
             
             if sys_config.E_BAT > 0:
                 soc_target = min(
@@ -123,6 +124,7 @@ class GoalManagementLayer:
             CI_grid=CI_grid,
             grid_available=grid_available,
             p_DC=p_DC,
+            p_PV=p_PV,
         )
         self._knowledge["goals"] = goals
         print(f"[GoalMgmt | Analyze] mode={mode.value}  SOC_target={soc_target:.1f}%")
@@ -143,6 +145,7 @@ class GoalManagementLayer:
         # ── Decision variables ────────────────────────────────────────────────
         p_ch    = [pulp.LpVariable(f"p_ch_{t}",    lowBound=0, upBound=sys_config.P_CH_MAX)  for t in range(n)]
         p_dch   = [pulp.LpVariable(f"p_dch_{t}",   lowBound=0, upBound=sys_config.P_DCH_MAX) for t in range(n)]
+        p_grid  = [pulp.LpVariable(f"p_grid_{t}",  lowBound=0, upBound=sys_config.P_GRID_MAX) for t in range(n)]
         soc     = [pulp.LpVariable(f"soc_{t}",     lowBound=sys_config.SOC_MIN, upBound=sys_config.SOC_MAX) for t in range(n)]
         unserved= [pulp.LpVariable(f"unserved_{t}", lowBound=0) for t in range(n)]
         soc_slack = [pulp.LpVariable(f"soc_slack_{t}", lowBound=0) for t in range(n)]
@@ -164,8 +167,7 @@ class GoalManagementLayer:
                 w_unserved * pulp.lpSum(unserved[t] for t in range(n))
                 + w_soc_low * pulp.lpSum(soc_slack[t] for t in range(n))
                 + pulp.lpSum(
-                    # Grid draw: p_DC + p_ch - p_dch - unserved
-                    goals.CI_grid.iloc[t] * (goals.p_DC.iloc[t] + p_ch[t] - p_dch[t] - unserved[t]) * dt
+                    goals.CI_grid.iloc[t] * p_grid[t] * dt
                     for t in range(n)
                 )
                 + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
@@ -176,8 +178,7 @@ class GoalManagementLayer:
                 w_unserved * pulp.lpSum(unserved[t] for t in range(n))
                 + w_soc_low  * pulp.lpSum(soc_slack[t] for t in range(n))
                 + w_carbon   * pulp.lpSum(
-                    # Grid draw: p_DC + p_ch - p_dch - unserved
-                    goals.CI_grid.iloc[t] * (goals.p_DC.iloc[t] + p_ch[t] - p_dch[t] - unserved[t]) * dt
+                    goals.CI_grid.iloc[t] * p_grid[t] * dt
                     for t in range(n)
                 )
                 + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
@@ -187,6 +188,7 @@ class GoalManagementLayer:
         for t in range(n):
             avail  = bool(goals.grid_available.iloc[t])
             p_dc_t = goals.p_DC.iloc[t]
+            p_pv_t = goals.p_PV.iloc[t] if goals.p_PV is not None else 0.0
 
             # SOC dynamics
             if t == 0:
@@ -210,14 +212,11 @@ class GoalManagementLayer:
                 prob += soc[t] + soc_slack[t] >= soc_baseline
 
             # Grid limits and balance
-            # Grid draw = p_dc_t + p_ch[t] - p_dch[t] - unserved[t]
-            p_grid_t = p_dc_t + p_ch[t] - p_dch[t] - unserved[t]
-            prob += p_grid_t >= 0
+            # p_grid_t must satisfy the energy balance (allow PV curtailment if p_grid_t >= 0 and RHS < 0)
+            prob += p_grid[t] >= p_dc_t - p_pv_t + p_ch[t] - p_dch[t] - unserved[t]
             
-            if avail:
-                prob += p_grid_t <= sys_config.P_GRID_MAX
-            else:
-                prob += p_grid_t == 0
+            if not avail:
+                prob += p_grid[t] == 0
 
 
         # End-of-day SOC target (soft: within ±10%)
@@ -273,3 +272,4 @@ class GoalManagementLayer:
         goals    = self.analyze(forecast, sys_config)
         plan     = self.plan(goals, sys_config, soc_init=soc_init)
         return goals, plan
+
