@@ -52,44 +52,39 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         )
         self.esdl_obj_mapping = {}
         self.current_soc = 50.0
-        self._shadow_subs = {}  # HELICS inputs registered outside framework tracking
-
 
         # ── Forecast error model ───────────────────────────────
         self._forecast_error = ForecastErrorModel()
 
         # ── Custom Calculation Setup ─────────────────────────────
+        da_inputs = [
+            SubscriptionDescription(esdl_type="PowerPlant", input_name="power_limit_plan_DA", input_unit="JSON", input_type=h.HelicsDataType.STRING),
+            SubscriptionDescription(esdl_type="PowerPlant", input_name="carbon_intensity_plan_DA", input_unit="JSON", input_type=h.HelicsDataType.STRING),
+            SubscriptionDescription(esdl_type="ElectricityDemand", input_name="demand_power_plan_da", input_unit="JSON", input_type=h.HelicsDataType.STRING),
+            SubscriptionDescription(esdl_type="PVInstallation", input_name="planned_generation_DA", input_unit="JSON", input_type=h.HelicsDataType.STRING),
+        ]
         da_info = HelicsCalculationInformation(
             time_period_in_seconds=86400,
-            offset=2,
+            offset=0,
             uninterruptible=False,
             wait_for_current_time_update=False,
             terminate_on_error=True,
             calculation_name="day_ahead_routing",
-            inputs=[],
+            inputs=da_inputs,
             outputs=[],
             calculation_function=self.day_ahead_routing
         )
         self.add_calculation(da_info)
 
         dispatch_inputs = [
-            # ONLY demand_power_w as formal input — Battery/PowerPlant are read
-            # via shadow subscriptions to avoid circular-dependency deadlock
-            # (Battery waits for bess_allocation_w from us, we'd wait for state_of_charge).
             SubscriptionDescription(esdl_type="ElectricityDemand", input_name="demand_power_w", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="Battery", input_name="state_of_charge", input_unit="pct", input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="Battery", input_name="bess_power_w", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="PowerPlant", input_name="actual_power_limit_ID", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="PowerPlant", input_name="actual_carbon_intensity_ID", input_unit="gCO2/kWh", input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="PVInstallation", input_name="potential_available_generation_ID", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
         ]
-        # Shadow subscription keys — registered during init, read non-blockingly
-        self._shadow_sub_keys = {
-            "soc":       ("Battery",           "state_of_charge",            "pct"),
-            "bess":      ("Battery",           "bess_power_w",               "W"),
-            "limit":     ("PowerPlant",        "actual_power_limit_ID",      "W"),
-            "ci":        ("PowerPlant",        "actual_carbon_intensity_ID", "gCO2/kWh"),
-            "da_limit":  ("PowerPlant",        "power_limit_plan_DA",        ""),
-            "da_ci":     ("PowerPlant",        "carbon_intensity_plan_DA",   ""),
-            "da_demand": ("ElectricityDemand", "demand_power_plan_DA",       ""),
-            "pv":        ("PVInstallation",    "potential_available_generation_ID", "W"),
-            "da_pv":     ("PVInstallation",    "planned_generation_DA",      ""), 
-        }
+        
         dispatch_outputs = [
             PublicationDescription(global_flag=True, esdl_type="ElectricityNetwork", output_name="bess_allocation_w", output_unit="W", data_type=h.HelicsDataType.DOUBLE),
             PublicationDescription(global_flag=True, esdl_type="ElectricityNetwork", output_name="grid_allocation_w", output_unit="W", data_type=h.HelicsDataType.DOUBLE),
@@ -98,7 +93,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         ]
         dispatch_info = HelicsCalculationInformation(
             time_period_in_seconds=900,
-            offset=10,
+            offset=0,
             uninterruptible=False,
             wait_for_current_time_update=False,
             terminate_on_error=True,
@@ -108,47 +103,6 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             calculation_function=self.network_dispatch
         )
         self.add_calculation(dispatch_info)
-
-    # ── Shadow subscription registration ──────────────────────────────────────
-
-    def start_simulation(self):
-        """Override to inject shadow HELICS subscriptions before execution mode."""
-        self._assert_that_periods_of_calculation_are_smaller_than_simulation_duration()
-        esdl_helper = self.init_simulation()
-
-        from concurrent.futures import ThreadPoolExecutor
-        self.exe = ThreadPoolExecutor(len(self.calculations))
-        for calc_executor in self.calculations:
-            calc_name = calc_executor.helics_value_federate_info.calculation_name
-            if calc_name == "network_dispatch":
-                # Wrap to inject shadow subs between init and exec mode
-                self.exe.submit(self._init_dispatch_with_shadow_subs, calc_executor, esdl_helper)
-            else:
-                self.exe.submit(calc_executor.initialize_and_start_federate, esdl_helper)
-
-    def _init_dispatch_with_shadow_subs(self, calc_executor, esdl_helper):
-        """init_federate → register shadow subs → start loop."""
-        calc_executor.init_federate(esdl_helper)
-        fed = calc_executor.value_federate
-
-        # Resolve connected Battery/PowerPlant asset IDs from ESDL
-        for esdl_id in self.simulator_configuration.esdl_ids:
-            network = self.esdl_obj_mapping.get(esdl_id)
-            if not network:
-                continue
-            for port in network.port:
-                for cp in port.connectedTo:
-                    asset = cp.eContainer()
-                    atype = type(asset).__name__
-                    for alias, (esdl_type, name, unit) in self._shadow_sub_keys.items():
-                        if atype == esdl_type and alias not in self._shadow_subs:
-                            key = f"{esdl_type}/{name}/{asset.id}"
-                            sub = h.helicsFederateRegisterSubscription(fed, key, unit)
-                            self._shadow_subs[alias] = sub
-                            LOGGER.info(f"Shadow subscription registered: {key}")
-
-        calc_executor.energy_system = esdl_helper.energy_system
-        calc_executor.start_value_federate()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -207,25 +161,8 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
 
     # ── Background thread helpers ─────────────────────────────────────────────
 
-    def _run_day_ahead_lp(self, simulation_time: datetime, esdl_id: str) -> None:
+    def _run_day_ahead_lp(self, simulation_time: datetime, esdl_id: str, raw_limit: str, raw_ci: str, raw_demand: str, raw_pv: str) -> None:
         try:
-            LOGGER.info("[DA thread] Waiting for day-ahead JSON signals from shadow subs...")
-            
-            raw_limit = None
-            raw_ci = None
-            raw_demand = None
-            raw_pv = None
-            
-            for _ in range(50):
-                if not raw_limit: raw_limit = self._read_shadow_string("da_limit")
-                if not raw_ci: raw_ci = self._read_shadow_string("da_ci")
-                if not raw_demand: raw_demand = self._read_shadow_string("da_demand")
-                if not raw_pv: raw_pv = self._read_shadow_string("da_pv")
-                if raw_limit and raw_ci and raw_demand:
-                    # PV is optional, if we get it earlier, great, but we shouldn't fail if absent
-                    break
-                time.sleep(0.1)
-
             if raw_limit:
                 LOGGER.info("[DA thread] Received power_limit_plan_DA JSON")
             else:
@@ -283,12 +220,9 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             self._pending_da_result = (goals, plan)
 
             # ── LOG Full Future DA Plan ──────────────────────────────────────
-            # FIX: Subtract the 2s offset to get clean timestamps at the 15-min marks
-            clean_start_time = simulation_time - timedelta(seconds=2)
-            
             p_bess_json, soc_json = [], []
             for i in range(len(plan.p_ch_b)):
-                future_time = clean_start_time + timedelta(seconds=900 * i)
+                future_time = simulation_time + timedelta(seconds=900 * i)
                 ts = future_time.isoformat()
                 
                 val_soc = float(plan.SOC_plan.iloc[i])
@@ -302,11 +236,11 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                 soc_json.append({"time": ts, "value": round(val_soc, 2)})
                 p_bess_json.append({"time": ts, "value": round(val_p, 1)})
 
-            # Log full JSON plans at the current simulation time (corrected)
-            self.influx_connector.set_time_step_data_point(esdl_id, "bess_power_plan_DA", clean_start_time, json.dumps(p_bess_json))
-            self.influx_connector.set_time_step_data_point(esdl_id, "soc_plan_DA",        clean_start_time, json.dumps(soc_json))
+            # Log full JSON plans at the current simulation time
+            self.influx_connector.set_time_step_data_point(esdl_id, "bess_power_plan_DA", simulation_time, json.dumps(p_bess_json))
+            self.influx_connector.set_time_step_data_point(esdl_id, "soc_plan_DA",        simulation_time, json.dumps(soc_json))
 
-            LOGGER.info(f"[DA thread] Plan generated and logged for T={clean_start_time.isoformat()}.")
+            LOGGER.info(f"[DA thread] Plan generated and logged for T={simulation_time.isoformat()}.")
         except Exception as exc:
             LOGGER.error(f"[DA thread] Failed: {exc}")
 
@@ -350,8 +284,19 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
     def day_ahead_routing(self, param_dict, simulation_time, time_step_number, esdl_id, energy_system):
         self._refresh_system_params(energy_system)
         self.current_day_step_idx = 0
-        LOGGER.info(f"[{simulation_time}] Running day-ahead LP synchronously.")
-        self._run_day_ahead_lp(simulation_time, esdl_id)
+        
+        raw_limit = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "power_limit_plan_DA")
+        raw_ci = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "carbon_intensity_plan_DA")
+        raw_demand = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "demand_power_plan_da")
+        raw_pv = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "planned_generation_DA")
+        
+        LOGGER.info(f"[{simulation_time}] Dispatching day-ahead LP thread.")
+        threading.Thread(
+            target=self._run_day_ahead_lp,
+            args=(simulation_time, esdl_id, raw_limit, raw_ci, raw_demand, raw_pv),
+            daemon=True
+        ).start()
+        
         return {}
 
     def network_dispatch(self, param_dict, simulation_time, time_step_number, esdl_id, energy_system):
@@ -367,58 +312,26 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             LOGGER.error(f"network_dispatch CRASHED at t={simulation_time}, step={self.current_day_step_idx}: {exc}", exc_info=True)
             raise
 
-    def _read_shadow_sub(self, alias: str):
-        """Non-blocking read of a shadow HELICS subscription. Returns double or None."""
-        sub = self._shadow_subs.get(alias)
-        if sub is None:
-            return None
-        try:
-            val = h.helicsInputGetDouble(sub)
-            return val if not math.isnan(val) else None
-        except Exception:
-            return None
-            
-    def _read_shadow_string(self, alias: str):
-        """Non-blocking read of a shadow HELICS subscription. Returns string or None."""
-        sub = self._shadow_subs.get(alias)
-        if sub is None:
-            return None
-        try:
-            val = h.helicsInputGetString(sub)
-            if val and len(val) > 0:
-                return val
-            return None
-        except Exception:
-            return None
-
     def _do_network_dispatch(self, param_dict, simulation_time, time_step_number, esdl_id, energy_system):
-        # FIX: Subtract the 10s offset to get clean timestamps at the 15-min marks
-        clean_time = simulation_time - timedelta(seconds=10)
-
         # ── 1. READ inputs ──
-        # demand_power_w: formal framework input (blocking wait handled by framework)
         demand_w = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "demand_power_w")
         if demand_w is None: demand_w = 0.0
 
-        # Battery SOC: shadow subscription (non-blocking)
         soc_actual = self.current_soc
-        soc_val = self._read_shadow_sub("soc")
+        soc_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "state_of_charge")
         if soc_val is not None:
             soc_actual = soc_val
             self.current_soc = soc_actual
 
-        # PowerPlant grid limit: shadow subscription (non-blocking)
-        lim_val = self._read_shadow_sub("limit")
+        lim_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "actual_power_limit_ID")
         if lim_val is not None:
             self._state_cache["actual_power_limit_ID"] = lim_val
 
-        # PowerPlant carbon intensity: shadow subscription (non-blocking)
-        ci_val = self._read_shadow_sub("ci")
+        ci_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "actual_carbon_intensity_ID")
         if ci_val is not None:
             self._state_cache["actual_carbon_intensity_ID"] = ci_val
 
-        # PV generation: shadow subscription (non-blocking)
-        pv_val = self._read_shadow_sub("pv")
+        pv_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "potential_available_generation_ID")
         pv_kw = (pv_val / 1000.0) if pv_val is not None else 0.0
 
         limit_w      = self._state_cache["actual_power_limit_ID"]
@@ -483,38 +396,38 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         # ── 4. COMPREHENSIVE LOGGING ──
         
         # Real-time Execution States
-        self.influx_connector.set_time_step_data_point(esdl_id, "Actual_SOC_from_Battery", clean_time, soc_actual)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Setpoint_from_Layers_kW", clean_time, setpoint_kw)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Grid_Available", clean_time, 1.0 if grid_available else 0.0)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Carbon_Intensity", clean_time, ci_val)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_Grid_W", clean_time, grid_w)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_BESS_W", clean_time, bess_w)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Requested_Power_W", clean_time, backup_w)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Total_Routed_Demand_W", clean_time, demand_w)
-        self.influx_connector.set_time_step_data_point(esdl_id, "PV_Generation_W", clean_time, pv_kw * 1000.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Actual_SOC_from_Battery", simulation_time, soc_actual)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Setpoint_from_Layers_kW", simulation_time, setpoint_kw)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Grid_Available", simulation_time, 1.0 if grid_available else 0.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Carbon_Intensity", simulation_time, ci_val)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_Grid_W", simulation_time, grid_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_BESS_W", simulation_time, bess_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Requested_Power_W", simulation_time, backup_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Total_Routed_Demand_W", simulation_time, demand_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "PV_Generation_W", simulation_time, pv_kw * 1000.0)
         
         # Carbon Metrics
-        self.influx_connector.set_time_step_data_point(esdl_id, "Total_Carbon_g", clean_time, exec_state.carbon)
-        self.influx_connector.set_time_step_data_point(esdl_id, "CI_DC_Consumption_gCO2_kWh", clean_time, exec_state.CI_DC_consumption)
-        self.influx_connector.set_time_step_data_point(esdl_id, "CI_Battery_gCO2_kWh", clean_time, exec_state.CI_battery)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Total_Carbon_g", simulation_time, exec_state.carbon)
+        self.influx_connector.set_time_step_data_point(esdl_id, "CI_DC_Consumption_gCO2_kWh", simulation_time, exec_state.CI_DC_consumption)
+        self.influx_connector.set_time_step_data_point(esdl_id, "CI_Battery_gCO2_kWh", simulation_time, exec_state.CI_battery)
 
         # Plan Comparisons (Current Step)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Planned_SOC", clean_time, planned_soc)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Planned_BESS_Power_W", clean_time, planned_bess_kw * 1000.0)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Forecasted_Grid_CI", clean_time, forecast_ci)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Forecasted_Grid_Available", clean_time, 1.0 if forecast_grid_avail else 0.0)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Forecasted_DC_Demand_W", clean_time, forecast_p_dc_kw * 1000.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Planned_SOC", simulation_time, planned_soc)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Planned_BESS_Power_W", simulation_time, planned_bess_kw * 1000.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Forecasted_Grid_CI", simulation_time, forecast_ci)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Forecasted_Grid_Available", simulation_time, 1.0 if forecast_grid_avail else 0.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Forecasted_DC_Demand_W", simulation_time, forecast_p_dc_kw * 1000.0)
 
         # Diagnostic Flags & Deviations
         if event:
-            self.influx_connector.set_time_step_data_point(esdl_id, "SOC_Drift_pct", clean_time, event.soc_drift)
-            self.influx_connector.set_time_step_data_point(esdl_id, "Demand_Delta_W", clean_time, event.demand_delta * 1000.0)
-            self.influx_connector.set_time_step_data_point(esdl_id, "Unplanned_Outage_Flag", clean_time, 1.0 if event.unplanned_outage else 0.0)
-            self.influx_connector.set_time_step_data_point(esdl_id, "Demand_Spike_Flag", clean_time, 1.0 if event.demand_spike else 0.0)
-            self.influx_connector.set_time_step_data_point(esdl_id, "Triggered_Replan_Flag", clean_time, 1.0 if event.triggered_replan else 0.0)
+            self.influx_connector.set_time_step_data_point(esdl_id, "SOC_Drift_pct", simulation_time, event.soc_drift)
+            self.influx_connector.set_time_step_data_point(esdl_id, "Demand_Delta_W", simulation_time, event.demand_delta * 1000.0)
+            self.influx_connector.set_time_step_data_point(esdl_id, "Unplanned_Outage_Flag", simulation_time, 1.0 if event.unplanned_outage else 0.0)
+            self.influx_connector.set_time_step_data_point(esdl_id, "Demand_Spike_Flag", simulation_time, 1.0 if event.demand_spike else 0.0)
+            self.influx_connector.set_time_step_data_point(esdl_id, "Triggered_Replan_Flag", simulation_time, 1.0 if event.triggered_replan else 0.0)
         
-        self.influx_connector.set_time_step_data_point(esdl_id, "MPC_Running_Flag", clean_time, 1.0 if self._mpc_running else 0.0)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Alarm_Active_Flag", clean_time, 1.0 if exec_state.alarm else 0.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "MPC_Running_Flag", simulation_time, 1.0 if self._mpc_running else 0.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Alarm_Active_Flag", simulation_time, 1.0 if exec_state.alarm else 0.0)
 
         return NetworkDispatchOutput(
             bess_allocation_w=bess_w,
