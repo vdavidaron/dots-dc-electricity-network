@@ -5,6 +5,15 @@ import logging
 import json
 import math
 import time
+import requests
+
+# Monkey-patch requests to ensure InfluxDB never hangs indefinitely
+_orig_request = requests.Session.request
+def _patched_request(self, method, url, **kwargs):
+    if 'timeout' not in kwargs or kwargs['timeout'] is None:
+        kwargs['timeout'] = 5.0  # 5 second timeout for DB operations
+    return _orig_request(self, method, url, **kwargs)
+requests.Session.request = _patched_request
 
 from esdl import esdl, EnergySystem
 import helics as h
@@ -59,13 +68,14 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         # ── Custom Calculation Setup ─────────────────────────────
         da_inputs = [
             SubscriptionDescription(esdl_type="PowerPlant", input_name="power_limit_plan_DA", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
+            SubscriptionDescription(esdl_type="PowerPlant", input_name="mandated_min_power_draw_DA", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
             SubscriptionDescription(esdl_type="PowerPlant", input_name="carbon_intensity_plan_DA", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
             SubscriptionDescription(esdl_type="ElectricityDemand", input_name="demand_power_plan_da", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
             SubscriptionDescription(esdl_type="PVInstallation", input_name="planned_generation_DA", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
         ]
         da_info = HelicsCalculationInformation(
             time_period_in_seconds=86400,
-            offset=0,
+            offset=2,
             uninterruptible=False,
             wait_for_current_time_update=False,
             terminate_on_error=True,
@@ -82,6 +92,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             SubscriptionDescription(esdl_type="Battery", input_name="bess_power_w", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
             SubscriptionDescription(esdl_type="PowerPlant", input_name="actual_power_limit_ID", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
             SubscriptionDescription(esdl_type="PowerPlant", input_name="actual_carbon_intensity_ID", input_unit="gCO2/kWh", input_type=h.HelicsDataType.DOUBLE),
+            SubscriptionDescription(esdl_type="PowerPlant", input_name="mandated_min_power_draw_ID", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
             SubscriptionDescription(esdl_type="PVInstallation", input_name="potential_available_generation_ID", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
         ]
         
@@ -93,7 +104,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         ]
         dispatch_info = HelicsCalculationInformation(
             time_period_in_seconds=900,
-            offset=0,
+            offset=10,
             uninterruptible=False,
             wait_for_current_time_update=False,
             terminate_on_error=True,
@@ -156,6 +167,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self._state_cache = {
             "actual_power_limit_ID": self.grid_import_limit_w,
             "actual_carbon_intensity_ID": 250.0,
+            "mandated_min_power_draw_ID": 0.0,
             "available_max_power": 0.0
         }
 
@@ -327,6 +339,10 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         if lim_val is not None:
             self._state_cache["actual_power_limit_ID"] = lim_val
 
+        min_mandate_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "mandated_min_power_draw_ID")
+        if min_mandate_val is not None:
+            self._state_cache["mandated_min_power_draw_ID"] = min_mandate_val
+
         ci_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "actual_carbon_intensity_ID")
         if ci_val is not None:
             self._state_cache["actual_carbon_intensity_ID"] = ci_val
@@ -429,10 +445,32 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.influx_connector.set_time_step_data_point(esdl_id, "MPC_Running_Flag", simulation_time, 1.0 if self._mpc_running else 0.0)
         self.influx_connector.set_time_step_data_point(esdl_id, "Alarm_Active_Flag", simulation_time, 1.0 if exec_state.alarm else 0.0)
 
+        # ── 5. MANDATE-AWARE PV CURTAILMENT ──
+        # mandatory_grid_import_w > 0 means the grid has surplus upstream generation
+        # that the microgrid MUST absorb. PV must be curtailed so it doesn't
+        # displace the mandatory grid import.
+        mandate_w = self._state_cache["mandated_min_power_draw_ID"]
+        mandatory_grid_import_w = max(0.0, mandate_w)  # only positive = surplus case
+
+        if mandatory_grid_import_w > 0.0:
+            # PV can only supply what remains after the mandatory grid import covers DC load.
+            # This forces the grid's surplus into the DC + battery.
+            pv_curtailment_limit_w = max(0.0, demand_w - mandatory_grid_import_w)
+            LOGGER.info(
+                "[Mandate] Grid surplus %.1f W — curtailing PV to %.1f W (demand=%.1f W)",
+                mandatory_grid_import_w, pv_curtailment_limit_w, demand_w
+            )
+        else:
+            # No surplus — PV may generate freely up to physical inverter capacity
+            pv_curtailment_limit_w = float("inf")
+
+        self.influx_connector.set_time_step_data_point(esdl_id, "Mandatory_Grid_Import_W", simulation_time, mandatory_grid_import_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "PV_Curtailment_Limit_W", simulation_time, pv_curtailment_limit_w if pv_curtailment_limit_w != float("inf") else -1.0)
+
         return NetworkDispatchOutput(
             bess_allocation_w=bess_w,
             grid_allocation_w=grid_w,
-            current_max_power_limit=limit_w,
+            current_max_power_limit=pv_curtailment_limit_w,
             backup_requested_power=backup_w,
         )
 
@@ -457,6 +495,19 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
 
             elif eClass.name == "PowerPlant":
                 self.grid_import_limit_w = float(getattr(obj, "power", 4000000.0))
+
+            elif eClass.name == "ElectricityNetwork":
+                if hasattr(obj, "KPIs") and obj.KPIs is not None:
+                    for kpi in obj.KPIs.kpi:
+                        if hasattr(kpi, "name") and hasattr(kpi, "value"):
+                            if kpi.name == "w_unserved":
+                                self.sys_config.w_unserved = float(kpi.value)
+                            elif kpi.name == "w_carbon":
+                                self.sys_config.w_carbon = float(kpi.value)
+                            elif kpi.name == "w_effort":
+                                self.sys_config.w_effort = float(kpi.value)
+                            elif kpi.name == "w_soc_low":
+                                self.sys_config.w_soc_low = float(kpi.value)
 
             elif eClass.name == "ElectricityDemand":
                 self.dc_base_load_w = float(getattr(obj, "power", 4000000.0))

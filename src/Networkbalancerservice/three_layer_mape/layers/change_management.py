@@ -224,10 +224,10 @@ class ChangeManagementLayer:
         soc_slack = [pulp.LpVariable(f"mpc_soc_slack_{t}", lowBound=0) for t in range(n)]
 
         # Objective — same as Goal Management
-        w_unserved = 1e9
-        w_carbon   = 1.0
-        w_effort   = 0.01
-        w_soc_low  = 1e6
+        w_unserved = sys_config.w_unserved
+        w_carbon   = sys_config.w_carbon
+        w_effort   = sys_config.w_effort
+        w_soc_low  = sys_config.w_soc_low
 
         if mode == OperationMode.CARBON_MINIMISE:
             prob += (
@@ -278,7 +278,13 @@ class ChangeManagementLayer:
                 prob += p_grid[t] == 0
 
         # Use a safe CMD solver for background execution to prevent temporary file clashes and blocking.
-        solver = pulp.PULP_CBC_CMD(msg=0, threads=1, keepFiles=False)
+        solver = pulp.PULP_CBC_CMD(
+            msg=0, 
+            threads=1, 
+            keepFiles=False, 
+            timeLimit=10,
+            options=['-presolve', 'off']
+        )
         prob.solve(solver)
 
         status = pulp.LpStatus[prob.status]

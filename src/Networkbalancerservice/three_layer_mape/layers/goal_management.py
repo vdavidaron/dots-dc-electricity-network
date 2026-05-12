@@ -33,6 +33,12 @@ class SystemConfig:
     EFF_DCH: float = 0.95
     P_GRID_MAX: float = 200.0
 
+    # Objective trade-off weights
+    w_unserved: float = 1e9
+    w_carbon: float = 1.0
+    w_effort: float = 0.01
+    w_soc_low: float = 1e6
+
 # ── Shared types ──────────────────────────────────────────────────────────────
 
 class OperationMode(Enum):
@@ -156,10 +162,10 @@ class GoalManagementLayer:
         # Priority 3: Minimise carbon
         # Priority 4: Minimise battery "effort" (reduces jumping/oscillation)
         
-        w_unserved = 1e9   # Huge penalty for unserved load (backup service)
-        w_carbon   = 1.0
-        w_effort   = 0.01  # Small penalty to avoid violent oscillations
-        w_soc_low  = 1e6   # Heavy penalty for dropping below target SOC (forces recharge)
+        w_unserved = sys_config.w_unserved
+        w_carbon   = sys_config.w_carbon
+        w_effort   = sys_config.w_effort
+        w_soc_low  = sys_config.w_soc_low
 
         if goals.mode == OperationMode.CARBON_MINIMISE:
             # Standard carbon mode — now with penalties to ensure service reliability and recharging
@@ -224,8 +230,14 @@ class GoalManagementLayer:
         prob += soc[n - 1] <= goals.SOC_target_end + 10.0
 
         # ── Solve ─────────────────────────────────────────────────────────────
-        # Use a safe CMD solver for background execution to prevent temporary file clashes and blocking.
-        solver = pulp.PULP_CBC_CMD(msg=0, threads=1, keepFiles=False)
+        # Solve with safety timeout and disabled presolve
+        solver = pulp.PULP_CBC_CMD(
+            msg=0, 
+            threads=1, 
+            keepFiles=False, 
+            timeLimit=15,
+            options=['-presolve', 'off']
+        )
         prob.solve(solver)
         status = pulp.LpStatus[prob.status]
         obj_val = pulp.value(prob.objective)
