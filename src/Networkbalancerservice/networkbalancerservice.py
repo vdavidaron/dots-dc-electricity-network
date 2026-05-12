@@ -58,10 +58,10 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
 
         # ── Custom Calculation Setup ─────────────────────────────
         da_inputs = [
-            SubscriptionDescription(esdl_type="PowerPlant", input_name="power_limit_plan_DA", input_unit="JSON", input_type=h.HelicsDataType.STRING),
-            SubscriptionDescription(esdl_type="PowerPlant", input_name="carbon_intensity_plan_DA", input_unit="JSON", input_type=h.HelicsDataType.STRING),
-            SubscriptionDescription(esdl_type="ElectricityDemand", input_name="demand_power_plan_da", input_unit="JSON", input_type=h.HelicsDataType.STRING),
-            SubscriptionDescription(esdl_type="PVInstallation", input_name="planned_generation_DA", input_unit="JSON", input_type=h.HelicsDataType.STRING),
+            SubscriptionDescription(esdl_type="PowerPlant", input_name="power_limit_plan_DA", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
+            SubscriptionDescription(esdl_type="PowerPlant", input_name="carbon_intensity_plan_DA", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
+            SubscriptionDescription(esdl_type="ElectricityDemand", input_name="demand_power_plan_da", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
+            SubscriptionDescription(esdl_type="PVInstallation", input_name="planned_generation_DA", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
         ]
         da_info = HelicsCalculationInformation(
             time_period_in_seconds=86400,
@@ -161,23 +161,23 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
 
     # ── Background thread helpers ─────────────────────────────────────────────
 
-    def _run_day_ahead_lp(self, simulation_time: datetime, esdl_id: str, raw_limit: str, raw_ci: str, raw_demand: str, raw_pv: str) -> None:
+    def _run_day_ahead_lp(self, simulation_time: datetime, esdl_id: str, raw_limit: list[float], raw_ci: list[float], raw_demand: list[float], raw_pv: list[float]) -> None:
         try:
             if raw_limit:
-                LOGGER.info("[DA thread] Received power_limit_plan_DA JSON")
+                LOGGER.info("[DA thread] Received power_limit_plan_DA VECTOR")
             else:
                 LOGGER.warning("[DA thread] Timed out waiting for power_limit_plan_DA. Using fallback.")
                 
             if raw_demand:
-                LOGGER.info("[DA thread] Received demand_power_plan_DA JSON")
+                LOGGER.info("[DA thread] Received demand_power_plan_da VECTOR")
             else:
-                LOGGER.warning("[DA thread] Timed out waiting for demand_power_plan_DA. Using fallback.")
+                LOGGER.warning("[DA thread] Timed out waiting for demand_power_plan_da. Using fallback.")
 
-            grid_limits_kw = self._parse_json_list(raw_limit, self.grid_import_limit_w / 1000.0)
+            grid_limits_kw = self._parse_vector(raw_limit, self.grid_import_limit_w / 1000.0, divide_by_1000=True)
             n = len(grid_limits_kw)
 
             if raw_ci:
-                ci_actual = self._parse_json_list(raw_ci, 250.0)
+                ci_actual = self._parse_vector(raw_ci, 250.0, divide_by_1000=False)
             else:
                 month = simulation_time.month
                 seasonal_offset = 40.0 * np.cos(2 * np.pi * (month - 1) / 12)
@@ -192,14 +192,14 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
 
             dc_base_kw = self.dc_base_load_w / 1000.0
             if raw_demand:
-                dc_demand_actual = self._parse_json_list(raw_demand, dc_base_kw)
+                dc_demand_actual = self._parse_vector(raw_demand, dc_base_kw, divide_by_1000=True)
             else:
                 dc_demand_actual = [
                     dc_base_kw * (1.0 + 0.03 * np.sin(2 * np.pi * i / n))
                     for i in range(n)
                 ]
 
-            pv_actual = self._parse_json_list(raw_pv, 0.0)
+            pv_actual = self._parse_vector(raw_pv, 0.0, divide_by_1000=True)
 
             forecast = {
                 "CI_grid":        self._forecast_error.perturb("CI_grid",  pd.Series(ci_actual)),
@@ -461,16 +461,12 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             elif eClass.name == "ElectricityDemand":
                 self.dc_base_load_w = float(getattr(obj, "power", 4000000.0))
 
-    def _parse_json_list(self, raw, default_kw):
-        if not raw: return [default_kw] * 96
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                return [float(x.get("value", x))/1000.0 if isinstance(x, dict) else float(x)/1000.0 for x in data]
-            elif isinstance(data, dict) and "generation_w" in data:
-                return [float(x)/1000.0 for x in data["generation_w"]]
-            return [float(data)/1000.0] * 96
-        except: return [default_kw] * 96
+    def _parse_vector(self, raw_list, default_kw, divide_by_1000=True):
+        if not raw_list or not isinstance(raw_list, list) or len(raw_list) == 0:
+            return [default_kw] * 96
+        
+        factor = 1000.0 if divide_by_1000 else 1.0
+        return [float(x) / factor for x in raw_list]
 
     def _heuristic_fallback(self, soc, limit_w, demand_w, pv_kw):
         # Convention: + discharge / - charge
