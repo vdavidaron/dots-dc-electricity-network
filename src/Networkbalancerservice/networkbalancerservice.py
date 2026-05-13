@@ -86,6 +86,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         _enable_goal_management = getattr(self.sys_config, 'enable_goal_management', True)
         _w_unserved = getattr(self.sys_config, 'w_unserved', 1e9)
         _w_carbon = getattr(self.sys_config, 'w_carbon', 1.0)
+        _w_price = getattr(self.sys_config, 'w_price', 0.0)
         _w_effort = getattr(self.sys_config, 'w_effort', 0.01)
         _w_soc_low = getattr(self.sys_config, 'w_soc_low', 1e6)
         _soc_baseline = getattr(self.sys_config, 'soc_baseline', 50.0)
@@ -108,6 +109,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.sys_config.enable_goal_management = _enable_goal_management
         self.sys_config.w_unserved = _w_unserved
         self.sys_config.w_carbon = _w_carbon
+        self.sys_config.w_price = _w_price
         self.sys_config.w_effort = _w_effort
         self.sys_config.w_soc_low = _w_soc_low
         self.sys_config.soc_baseline = _soc_baseline
@@ -143,18 +145,30 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.current_day_step_idx = 0
         self._pending_da_result: Optional[Tuple[Goals, SchedulePlan]] = None
         self._mpc_running  = False
-        self.current_ci_battery = 250.0  # [gCO2/kWh] Initial assumption
+        self.current_ci_battery    = 250.0  # [gCO2/kWh] Initial assumption
+        self.current_price_battery = 0.0    # [EUR/MWh] Initial assumption
+
+        # Cumulative running totals (reset on service init only — not per day)
+        self._cum_carbon_g       = 0.0   # gCO2
+        self._cum_cost_eur       = 0.0   # EUR
+        self._cum_unserved_kwh   = 0.0   # kWh
+        self._cum_grid_energy_kwh = 0.0  # kWh — denominator for effective CI/price
+
+        # Counterfactual "no-optimisation" baseline: spot-price × instantaneous DC load
+        self._cum_baseline_cost_eur = 0.0  # EUR — what DC would have paid at spot
+        self._cum_baseline_carbon_g = 0.0  # gCO2 — same baseline for carbon
         
         self._state_cache = {
             "actual_power_limit_ID": self.grid_import_limit_w,
             "actual_carbon_intensity_ID": 250.0,
+            "actual_electricity_price_ID": 50.0,
             "mandated_min_power_draw_ID": 0.0,
             "available_max_power": 0.0
         }
 
     # ── Background thread helpers ─────────────────────────────────────────────
 
-    def _run_day_ahead_lp(self, simulation_time: datetime, esdl_id: str, raw_limit: list[float], raw_ci: list[float], raw_demand: list[float], raw_pv: list[float]) -> None:
+    def _run_day_ahead_lp(self, simulation_time: datetime, esdl_id: str, raw_limit: list[float], raw_ci: list[float], raw_price: list[float], raw_demand: list[float], raw_pv: list[float]) -> None:
         try:
             if raw_limit:
                 LOGGER.info("[DA thread] Received power_limit_plan_DA VECTOR")
@@ -194,19 +208,25 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
 
             pv_actual = self._parse_vector(raw_pv, 0.0, divide_by_1000=True)
 
+            price_actual = self._parse_vector(raw_price, 50.0, divide_by_1000=False)
+            if len(price_actual) != n:
+                price_actual = (price_actual + [price_actual[-1]] * n)[:n]
+
             forecast = {
                 "CI_grid":        self._forecast_error.perturb("CI_grid",  pd.Series(ci_actual)),
                 "grid_available": pd.Series([(v > 0) for v in grid_limits_kw]),
                 "p_DC":           self._forecast_error.perturb("p_DC",     pd.Series(dc_demand_actual)),
                 "p_PV":           pd.Series(pv_actual),
+                "price_E":        self._forecast_error.perturb("price_E", pd.Series(price_actual)),
             }
 
             LOGGER.info(
-                "[DA Forecast] t=%s  n=%d steps  CI_mean=%.0f gCO2/kWh  p_DC_mean=%.0f kW  p_PV_mean=%.0f kW",
+                "[DA Forecast] t=%s  n=%d steps  CI_mean=%.0f gCO2/kWh  p_DC_mean=%.0f kW  p_PV_mean=%.0f kW  price_mean=%.1f EUR/MWh",
                 simulation_time.isoformat(), n,
                 float(forecast["CI_grid"].mean()),
                 float(forecast["p_DC"].mean()),
-                float(forecast["p_PV"].mean())
+                float(forecast["p_PV"].mean()),
+                float(forecast["price_E"].mean())
             )
 
             if getattr(self.sys_config, 'enable_goal_management', True):
@@ -218,7 +238,8 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                     CI_grid=forecast["CI_grid"],
                     grid_available=forecast["grid_available"],
                     p_DC=forecast["p_DC"],
-                    p_PV=forecast["p_PV"]
+                    p_PV=forecast["p_PV"],
+                    price_E=forecast["price_E"]
                 )
                 flat_p_ch_b = pd.Series([0.0] * n, index=forecast["CI_grid"].index)
                 target_soc = 0.0 if self.sys_config.E_BAT == 0.0 else self.current_soc
@@ -295,13 +316,14 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         
         raw_limit = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "power_limit_plan_DA")
         raw_ci = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "carbon_intensity_plan_DA")
+        raw_price = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "electricity_price_plan_DA")
         raw_demand = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "demand_power_plan_da")
         raw_pv = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "planned_generation_DA")
-        
+
         LOGGER.info(f"[{simulation_time}] Dispatching day-ahead LP thread.")
         threading.Thread(
             target=self._run_day_ahead_lp,
-            args=(simulation_time, esdl_id, raw_limit, raw_ci, raw_demand, raw_pv),
+            args=(simulation_time, esdl_id, raw_limit, raw_ci, raw_price, raw_demand, raw_pv),
             daemon=True
         ).start()
         
@@ -342,6 +364,10 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         ci_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "actual_carbon_intensity_ID")
         if ci_val is not None:
             self._state_cache["actual_carbon_intensity_ID"] = ci_val
+
+        price_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "actual_electricity_price_ID")
+        if price_val is not None:
+            self._state_cache["actual_electricity_price_ID"] = price_val
 
         pv_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "potential_available_generation_ID")
         pv_kw = (pv_val / 1000.0) if pv_val is not None else 0.0
@@ -413,20 +439,24 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             setpoint_kw = self._heuristic_fallback(soc_actual, limit_w, demand_w, pv_kw)
 
         # ── 3. EXECUTION ──
+        price_now = self._state_cache.get("actual_electricity_price_ID", 0.0)
         exec_state = self.control_layer.execute_step(
-            setpoint_kw, 
-            soc_actual, 
-            grid_available, 
-            p_dc_kw, 
-            ci_val, 
-            self.sys_config, 
-            CI_battery_prev=self.current_ci_battery, 
+            setpoint_kw,
+            soc_actual,
+            grid_available,
+            p_dc_kw,
+            ci_val,
+            self.sys_config,
+            CI_battery_prev=self.current_ci_battery,
+            Price_grid=price_now,
+            Price_battery_prev=self.current_price_battery,
             p_PV=pv_kw,
             p_grid_limit_kw=(limit_w / 1000.0)
         )
-        
+
         self.current_day_step_idx += 1
-        self.current_ci_battery = exec_state.CI_battery
+        self.current_ci_battery    = exec_state.CI_battery
+        self.current_price_battery = exec_state.Price_battery
 
         # BESS Allocation: (+ discharge / - charge)
         bess_w = exec_state.p_ch_b * 1000.0
@@ -456,6 +486,8 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.influx_connector.set_time_step_data_point(esdl_id, "Setpoint_from_Layers_kW", simulation_time, setpoint_kw)
         self.influx_connector.set_time_step_data_point(esdl_id, "Grid_Available", simulation_time, 1.0 if grid_available else 0.0)
         self.influx_connector.set_time_step_data_point(esdl_id, "Carbon_Intensity", simulation_time, ci_val)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Electricity_Price_EUR_per_MWh", simulation_time, price_now)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Step_Cost_EUR", simulation_time, exec_state.cost)
         self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_Grid_W", simulation_time, grid_w)
         self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_BESS_W", simulation_time, bess_w)
         self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Requested_Power_W", simulation_time, backup_w)
@@ -466,10 +498,34 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Supplied_Power_W", simulation_time, backup_supplied_w)
         self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Max_Capacity_W", simulation_time, backup_max_w)
         
-        # Carbon Metrics
+        # Carbon + Price Metrics (per-step)
         self.influx_connector.set_time_step_data_point(esdl_id, "Total_Carbon_g", simulation_time, exec_state.carbon)
         self.influx_connector.set_time_step_data_point(esdl_id, "CI_DC_Consumption_gCO2_kWh", simulation_time, exec_state.CI_DC_consumption)
         self.influx_connector.set_time_step_data_point(esdl_id, "CI_Battery_gCO2_kWh", simulation_time, exec_state.CI_battery)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Price_DC_Consumption_EUR_MWh", simulation_time, exec_state.Price_DC_consumption)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Price_Battery_EUR_MWh", simulation_time, exec_state.Price_battery)
+
+        # Cumulative running totals (each measurement = sum from t=0 up to this step)
+        step_unserved_kwh = exec_state.unserved * self.sys_config.dt
+        self._cum_carbon_g        += exec_state.carbon
+        self._cum_cost_eur        += exec_state.cost
+        self._cum_unserved_kwh    += step_unserved_kwh
+        self._cum_grid_energy_kwh += exec_state.p_grid * self.sys_config.dt
+
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Carbon_g", simulation_time, self._cum_carbon_g)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Cost_EUR", simulation_time, self._cum_cost_eur)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Unserved_kWh", simulation_time, self._cum_unserved_kwh)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Grid_Energy_kWh", simulation_time, self._cum_grid_energy_kwh)
+
+        # Counterfactual baseline: spot price × DC load (no BESS / no PV optimisation)
+        step_baseline_cost_eur = price_now * (p_dc_kw * self.sys_config.dt) / 1000.0
+        step_baseline_carbon_g = ci_val * (p_dc_kw * self.sys_config.dt)
+        self._cum_baseline_cost_eur += step_baseline_cost_eur
+        self._cum_baseline_carbon_g += step_baseline_carbon_g
+        self.influx_connector.set_time_step_data_point(esdl_id, "Baseline_Step_Cost_EUR", simulation_time, step_baseline_cost_eur)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Baseline_Step_Carbon_g", simulation_time, step_baseline_carbon_g)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Baseline_Cost_EUR", simulation_time, self._cum_baseline_cost_eur)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Baseline_Carbon_g", simulation_time, self._cum_baseline_carbon_g)
 
         # Plan Comparisons (Current Step)
         self.influx_connector.set_time_step_data_point(esdl_id, "Planned_SOC", simulation_time, planned_soc)
@@ -549,6 +605,8 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                                 self.sys_config.w_unserved = float(kpi.value)
                             elif kpi.name == "w_carbon":
                                 self.sys_config.w_carbon = float(kpi.value)
+                            elif kpi.name == "w_price":
+                                self.sys_config.w_price = float(kpi.value)
                             elif kpi.name == "w_effort":
                                 self.sys_config.w_effort = float(kpi.value)
                             elif kpi.name == "w_soc_low":

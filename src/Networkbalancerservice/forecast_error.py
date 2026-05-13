@@ -55,12 +55,14 @@ LOGGER = logging.getLogger(__name__)
 _DEFAULT_SIGMA = {
     "CI_grid":  0.12,   # 12 % — ENTSO-E / Staffell & Pfenninger (2016)
     "p_DC":     0.05,   # 5 %  — Pelley et al. (2009)
+    "price_E":  0.15,   # 15 % — Weron (2014) day-ahead EPEX SPOT NL
 }
 
 # Physical lower bounds — a perturbed forecast must stay above these
 _LOWER_BOUND = {
     "CI_grid":  10.0,   # gCO2/kWh — practically zero-carbon floor
     "p_DC":     0.0,    # kW      — demand cannot be negative
+    "price_E":  -500.0, # EUR/MWh — NL day-ahead can go negative, but bounded
 }
 
 

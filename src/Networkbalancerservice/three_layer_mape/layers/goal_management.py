@@ -35,6 +35,7 @@ class SystemConfig:
     # Objective trade-off weights
     w_unserved: float = 1e9
     w_carbon: float = 1.0
+    w_price: float = 0.0  # cost term weight; price in EUR/MWh, p_grid in kW, dt in h
     w_effort: float = 0.01
     w_soc_low: float = 1e6
     soc_baseline: float = 50.0  # Soft SOC target [%]
@@ -56,6 +57,7 @@ class Goals:
     grid_available: pd.Series       # 24h grid availability [bool]
     p_DC:           pd.Series       # 24h DC load forecast  [kW]
     p_PV:           Optional[pd.Series] = None # 24h PV forecast [kW]
+    price_E:        Optional[pd.Series] = None # 24h day-ahead price [EUR/MWh]
 
 
 @dataclass
@@ -100,10 +102,11 @@ class GoalManagementLayer:
         grid_available = forecast["grid_available"]
         p_DC           = forecast["p_DC"]
         p_PV           = forecast.get("p_PV", pd.Series([0.0]*len(p_DC), index=p_DC.index))
+        price_E        = forecast.get("price_E", pd.Series([0.0]*len(p_DC), index=p_DC.index))
 
         outage_hours  = int((~grid_available).sum())
         energy_needed = max(0, (p_DC - p_PV).mean()) * outage_hours          # kWh
-        
+
         if sys_config.E_BAT > 0:
             soc_target = min(
                 sys_config.SOC_MAX,
@@ -118,6 +121,7 @@ class GoalManagementLayer:
             grid_available=grid_available,
             p_DC=p_DC,
             p_PV=p_PV,
+            price_E=price_E,
         )
         self._knowledge["goals"] = goals
         print(f"[GoalMgmt | Analyze] SOC_target={soc_target:.1f}%")
@@ -151,14 +155,21 @@ class GoalManagementLayer:
         
         w_unserved = sys_config.w_unserved
         w_carbon   = sys_config.w_carbon
+        w_price    = getattr(sys_config, "w_price", 0.0)
         w_effort   = sys_config.w_effort
         w_soc_low  = sys_config.w_soc_low
+
+        price = goals.price_E if goals.price_E is not None else pd.Series([0.0] * n, index=T)
 
         prob += (
             w_unserved * pulp.lpSum(unserved[t] for t in range(n))
             + w_soc_low  * pulp.lpSum(soc_slack[t] for t in range(n))
             + w_carbon   * pulp.lpSum(
                 goals.CI_grid.iloc[t] * p_grid[t] * dt
+                for t in range(n)
+            )
+            + w_price * pulp.lpSum(
+                price.iloc[t] * p_grid[t] * dt
                 for t in range(n)
             )
             + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))

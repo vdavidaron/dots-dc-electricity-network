@@ -195,6 +195,7 @@ class ChangeManagementLayer:
         ci      = self.goals.CI_grid.iloc[hour: hour + horizon]
         avail   = self.goals.grid_available.iloc[hour: hour + horizon]
         pv      = self.goals.p_PV.iloc[hour: hour + horizon] if self.goals.p_PV is not None else pd.Series([0.0]*horizon, index=T_mpc)
+        price   = self.goals.price_E.iloc[hour: hour + horizon] if self.goals.price_E is not None else pd.Series([0.0]*horizon, index=T_mpc)
 
         # If a demand spike was detected, patch the forecast for the MPC horizon
         # with the observed actual demand so the LP doesn't optimise against a
@@ -225,6 +226,7 @@ class ChangeManagementLayer:
         # Objective — same as Goal Management
         w_unserved = sys_config.w_unserved
         w_carbon   = sys_config.w_carbon
+        w_price    = getattr(sys_config, "w_price", 0.0)
         w_effort   = sys_config.w_effort
         w_soc_low  = sys_config.w_soc_low
 
@@ -233,6 +235,10 @@ class ChangeManagementLayer:
             + w_soc_low * pulp.lpSum(soc_slack[t] for t in range(n))
             + w_carbon * pulp.lpSum(
                 ci.iloc[t] * p_grid[t] * dt
+                for t in range(n)
+            )
+            + w_price * pulp.lpSum(
+                price.iloc[t] * p_grid[t] * dt
                 for t in range(n)
             )
             + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))

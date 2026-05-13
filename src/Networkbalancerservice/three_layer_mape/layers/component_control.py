@@ -20,9 +20,12 @@ class ComponentState:
     p_grid:    float    # Realised grid draw [kW]
     p_DC:      float    # DC load [kW]
     unserved:  float    # Unserved DC load [kW]
-    carbon:    float    # Scope 2 CO2 this hour [gCO2]
+    carbon:    float    # Scope 2 CO2 this step [gCO2]
+    cost:      float    # Energy cost this step [EUR]
     CI_battery: float   # Carbon intensity of energy in battery [gCO2/kWh]
+    Price_battery: float # Price intensity of energy in battery [EUR/MWh]
     CI_DC_consumption: float # Effective CI of energy consumed by DC [gCO2/kWh]
+    Price_DC_consumption: float # Effective price of energy consumed by DC [EUR/MWh]
     alarm:     bool  = False
     alarm_msg: str   = ""
 
@@ -48,6 +51,8 @@ class ComponentControlLayer:
         CI_grid:    float,          # Carbon intensity [gCO2/kWh]
         sys_config: SystemConfig,    # Dynamic system configuration
         CI_battery_prev: float = 250.0, # CI of energy already in battery [gCO2/kWh]
+        Price_grid: float = 0.0,    # Day-ahead price [EUR/MWh]
+        Price_battery_prev: float = 0.0, # Price intensity of energy in battery [EUR/MWh]
         p_PV:       float = 0.0,    # Actual PV generation [kW]
         p_grid_limit_kw: float = 1e9 # Actual dynamic grid limit [kW]
     ) -> ComponentState:
@@ -128,9 +133,11 @@ class ComponentControlLayer:
             covered  = p_PV + max(0.0, p_ref)
             unserved = max(0.0, p_DC - covered)
 
-        # ── Carbon accounting ────────────────────────────────────────────────
+        # ── Mass-balance accounting (carbon + price) ─────────────────────────
         energy_in_battery = (soc_actual / 100.0) * sys_config.E_BAT  # [kWh]
         carbon_in_battery = energy_in_battery * CI_battery_prev      # [gCO2]
+        # price reservoir is in EUR/MWh × kWh = milliEUR (kept in EUR·kWh/MWh units)
+        price_in_battery  = energy_in_battery * Price_battery_prev   # [EUR·kWh/MWh]
 
         if p_ref < 0:
             # Charging: figure out if grid or PV is providing the charge
@@ -139,42 +146,61 @@ class ComponentControlLayer:
             p_PV_excess = max(0.0, p_PV - p_DC)
             p_PV_to_BESS = min(p_charge, p_PV_excess)
             p_grid_to_BESS = max(0.0, p_charge - p_PV_to_BESS)
-            
+
             energy_added = p_charge * dt * sys_config.EFF_CH
-            # Zero carbon for PV part, grid carbon for grid part
+            # Zero CI / zero price for PV charge; grid CI / grid price for grid charge
             carbon_added = (p_grid_to_BESS * CI_grid + p_PV_to_BESS * 0.0) * dt * sys_config.EFF_CH
-            
+            price_added  = (p_grid_to_BESS * Price_grid + p_PV_to_BESS * 0.0) * dt * sys_config.EFF_CH
+
             carbon_in_battery += carbon_added
+            price_in_battery  += price_added
             energy_in_battery += energy_added
-            
+
             p_grid_to_DC = max(0.0, p_grid - p_grid_to_BESS)
             p_bess_to_DC = 0.0
         else:
-            # Discharging: remove battery carbon
+            # Discharging: remove proportional carbon & price reservoir
             p_discharge = p_ref
             energy_removed = (p_discharge * dt) / sys_config.EFF_DCH
             carbon_in_battery -= energy_removed * CI_battery_prev
+            price_in_battery  -= energy_removed * Price_battery_prev
             energy_in_battery -= energy_removed
-            
+
             p_grid_to_DC = p_grid
             p_bess_to_DC = p_discharge
 
-        CI_battery_new = carbon_in_battery / energy_in_battery if energy_in_battery > 0.01 else CI_battery_prev
-        
-        # Calculate effective CI of DC consumption
-        total_dc_carbon = (CI_grid * p_grid_to_DC + CI_battery_prev * p_bess_to_DC) * dt
-        # unserved covered by backup generator?
+        if energy_in_battery > 0.01:
+            CI_battery_new    = carbon_in_battery / energy_in_battery
+            Price_battery_new = price_in_battery  / energy_in_battery
+        else:
+            CI_battery_new    = CI_battery_prev
+            Price_battery_new = Price_battery_prev
+
+        # Effective CI / price of DC consumption (grid + battery, plus backup if any)
+        total_dc_carbon = (CI_grid    * p_grid_to_DC + CI_battery_prev    * p_bess_to_DC) * dt
+        total_dc_price  = (Price_grid * p_grid_to_DC + Price_battery_prev * p_bess_to_DC) * dt
         if getattr(sys_config, 'enable_backup_generator', True) and unserved > 0:
-            # Assume 600 gCO2/kWh for backup generator
+            # Backup CO2 assumption (600 gCO2/kWh); no fuel cost attributed here.
             total_dc_carbon += (600.0 * unserved) * dt
 
-        CI_DC_consumption = total_dc_carbon / (p_DC * dt) if p_DC > 0.01 else CI_grid
+        if p_DC > 0.01:
+            CI_DC_consumption    = total_dc_carbon / (p_DC * dt)
+            Price_DC_consumption = total_dc_price  / (p_DC * dt)
+        else:
+            CI_DC_consumption    = CI_grid
+            Price_DC_consumption = Price_grid
+
+        # Step monetary cost = price × grid energy / 1000 (EUR/MWh × kWh → EUR)
+        step_cost_eur = Price_grid * (p_grid * dt) / 1000.0
 
         return ComponentState(
             SOC=new_soc, p_ch_b=p_ref, p_grid=p_grid,
             p_DC=p_DC, unserved=unserved,
             carbon=total_dc_carbon,
+            cost=step_cost_eur,
             CI_battery=CI_battery_new,
+            Price_battery=Price_battery_new,
             CI_DC_consumption=CI_DC_consumption,
+            Price_DC_consumption=Price_DC_consumption,
             alarm=alarm, alarm_msg=alarm_msg,
         )

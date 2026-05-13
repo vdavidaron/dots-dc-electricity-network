@@ -13,6 +13,7 @@
                 { "name": "power_limit_plan_DA", "esdl_type": "PowerPlant", "data_type": "VECTOR", "description": "Grid limits", "unit": "VECTOR" },
                 { "name": "mandated_min_power_draw_DA", "esdl_type": "PowerPlant", "data_type": "VECTOR", "description": "Grid mandate plan", "unit": "VECTOR" },
                 { "name": "carbon_intensity_plan_DA", "esdl_type": "PowerPlant", "data_type": "VECTOR", "description": "Grid carbon", "unit": "VECTOR" },
+                { "name": "electricity_price_plan_DA", "esdl_type": "PowerPlant", "data_type": "VECTOR", "description": "Grid price forecast", "unit": "VECTOR" },
                 { "name": "demand_power_plan_da", "esdl_type": "ElectricityDemand", "data_type": "VECTOR", "description": "Demand forecast", "unit": "VECTOR" },
                 { "name": "planned_generation_DA", "esdl_type": "PVInstallation", "data_type": "VECTOR", "description": "RES forecast", "unit": "VECTOR" }
             ],
@@ -30,6 +31,7 @@
                 { "name": "actual_power_limit_ID", "esdl_type": "PowerPlant", "data_type": "DOUBLE", "description": "Grid limit", "unit": "W" },
                 { "name": "actual_carbon_intensity_ID", "esdl_type": "PowerPlant", "data_type": "DOUBLE", "description": "Grid carbon", "unit": "gCO2/kWh" },
                 { "name": "mandated_min_power_draw_ID", "esdl_type": "PowerPlant", "data_type": "DOUBLE", "description": "Real-time mandate", "unit": "W" },
+                { "name": "actual_electricity_price_ID", "esdl_type": "PowerPlant", "data_type": "DOUBLE", "description": "Real-time electricity price", "unit": "EUR/MWh" },
                 { "name": "potential_available_generation_ID", "esdl_type": "PVInstallation", "data_type": "DOUBLE", "description": "RES potential", "unit": "W" },
                 { "name": "backup_supplied_power", "esdl_type": "GasProducer", "data_type": "DOUBLE", "description": "Backup actual output", "unit": "W" },
                 { "name": "available_max_power", "esdl_type": "GasProducer", "data_type": "DOUBLE", "description": "Backup max capacity", "unit": "W" }
