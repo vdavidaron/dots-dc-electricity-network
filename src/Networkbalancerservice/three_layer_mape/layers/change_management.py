@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import pulp
 
-from .goal_management import Goals, OperationMode, SchedulePlan, SystemConfig
+from .goal_management import Goals, SchedulePlan, SystemConfig
 
 
 # ── Deviation event ───────────────────────────────────────────────────────────
@@ -195,7 +195,6 @@ class ChangeManagementLayer:
         ci      = self.goals.CI_grid.iloc[hour: hour + horizon]
         avail   = self.goals.grid_available.iloc[hour: hour + horizon]
         pv      = self.goals.p_PV.iloc[hour: hour + horizon] if self.goals.p_PV is not None else pd.Series([0.0]*horizon, index=T_mpc)
-        mode    = self.goals.mode
 
         # If a demand spike was detected, patch the forecast for the MPC horizon
         # with the observed actual demand so the LP doesn't optimise against a
@@ -229,26 +228,15 @@ class ChangeManagementLayer:
         w_effort   = sys_config.w_effort
         w_soc_low  = sys_config.w_soc_low
 
-        if mode == OperationMode.CARBON_MINIMISE:
-            prob += (
-                w_unserved * pulp.lpSum(unserved[t] for t in range(n))
-                + w_soc_low * pulp.lpSum(soc_slack[t] for t in range(n))
-                + pulp.lpSum(
-                    ci.iloc[t] * p_grid[t] * dt
-                    for t in range(n)
-                )
-                + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
+        prob += (
+            w_unserved * pulp.lpSum(unserved[t] for t in range(n))
+            + w_soc_low * pulp.lpSum(soc_slack[t] for t in range(n))
+            + w_carbon * pulp.lpSum(
+                ci.iloc[t] * p_grid[t] * dt
+                for t in range(n)
             )
-        elif mode == OperationMode.NONFIRM:
-            prob += (
-                w_unserved * pulp.lpSum(unserved[t] for t in range(n))
-                + w_soc_low * pulp.lpSum(soc_slack[t] for t in range(n))
-                + w_carbon * pulp.lpSum(
-                    ci.iloc[t] * p_grid[t] * dt
-                    for t in range(n)
-                )
-                + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
-            )
+            + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
+        )
 
         # Constraints
         for t in range(n):
@@ -266,10 +254,9 @@ class ChangeManagementLayer:
                 prob += p_ch[t] == 0.0
                 prob += p_dch[t] == 0.0
 
-            # Soft SOC target: prefer keeping SOC above a baseline
+            # Soft SOC target: prefer keeping SOC above the configurable baseline
             if sys_config.E_BAT > 0.0:
-                soc_baseline = 70.0 if mode == OperationMode.NONFIRM else 50.0
-                prob += soc_var[t] + soc_slack[t] >= soc_baseline
+                prob += soc_var[t] + soc_slack[t] >= sys_config.soc_baseline
 
             # Grid limits and balance
             prob += p_grid[t] >= p_dc_t - p_pv_t + p_ch[t] - p_dch[t] - unserved[t]

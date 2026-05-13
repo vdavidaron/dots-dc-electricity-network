@@ -48,7 +48,8 @@ class ComponentControlLayer:
         CI_grid:    float,          # Carbon intensity [gCO2/kWh]
         sys_config: SystemConfig,    # Dynamic system configuration
         CI_battery_prev: float = 250.0, # CI of energy already in battery [gCO2/kWh]
-        p_PV:       float = 0.0     # Actual PV generation [kW]
+        p_PV:       float = 0.0,    # Actual PV generation [kW]
+        p_grid_limit_kw: float = 1e9 # Actual dynamic grid limit [kW]
     ) -> ComponentState:
 
         dt        = sys_config.dt
@@ -56,17 +57,25 @@ class ComponentControlLayer:
         alarm_msg = ""
         p_ref     = setpoint # + discharge / - charge
 
-        # ── Override: if grid unexpectedly down, discharge to cover net DC load ──
-        if not grid_avail:
-            p_ref     = np.clip(p_DC - p_PV, -sys_config.P_CH_MAX, sys_config.P_DCH_MAX)
-            alarm     = True
-            alarm_msg = "Unplanned grid outage — emergency islanding"
+        # Use the provided dynamic limit if it's smaller than the nameplate capacity
+        actual_limit_kw = min(sys_config.P_GRID_MAX, p_grid_limit_kw) if grid_avail else 0.0
 
-        # ── Hard power clamp ─────────────────────────────────────────────────
-        p_ref = np.clip(p_ref, -sys_config.P_CH_MAX, sys_config.P_DCH_MAX)
+        # ── Battery Enablement Check ─────────────────────────────────────────
+        battery_enabled = getattr(sys_config, 'enable_battery', True)
+        if not battery_enabled:
+            p_ref = 0.0
+        else:
+            # ── Override: if grid unexpectedly down, discharge to cover net DC load ──
+            if not grid_avail:
+                p_ref     = np.clip(p_DC - p_PV, -sys_config.P_CH_MAX, sys_config.P_DCH_MAX)
+                alarm     = True
+                alarm_msg = "Unplanned grid outage — emergency islanding"
+
+            # ── Hard power clamp ─────────────────────────────────────────────────
+            p_ref = np.clip(p_ref, -sys_config.P_CH_MAX, sys_config.P_DCH_MAX)
 
         # ── SOC bounds ───────────────────────────────────────────────────────
-        if sys_config.E_BAT > 0.0:
+        if battery_enabled and sys_config.E_BAT > 0.0:
             # delta_soc = (power * dt / energy) * 100
             # Charging: p_ref < 0, efficiency increases energy needed
             # Discharging: p_ref > 0, efficiency reduces energy available
@@ -104,15 +113,15 @@ class ComponentControlLayer:
             p_grid_calc = p_DC - p_PV - p_ref
             
             # If grid limit hit, we must first reduce charging (if any), then discharge more (if possible), then shed load.
-            if p_grid_calc > sys_config.P_GRID_MAX:
-                # We need p_grid = p_DC - p_PV - p_ref_new <= P_GRID_MAX
-                # So p_ref_new >= p_DC - p_PV - P_GRID_MAX
-                p_ref_new = max(p_ref, p_DC - p_PV - sys_config.P_GRID_MAX)
+            if p_grid_calc > actual_limit_kw:
+                # We need p_grid = p_DC - p_PV - p_ref_new <= actual_limit_kw
+                # So p_ref_new >= p_DC - p_PV - actual_limit_kw
+                p_ref_new = max(p_ref, p_DC - p_PV - actual_limit_kw)
                 p_ref = np.clip(p_ref_new, -sys_config.P_CH_MAX, sys_config.P_DCH_MAX)
                 p_grid_calc = p_DC - p_PV - p_ref
                 
-            p_grid = np.clip(p_grid_calc, 0, sys_config.P_GRID_MAX)
-            unserved = max(0.0, p_DC - p_PV - p_ref - sys_config.P_GRID_MAX)
+            p_grid = np.clip(p_grid_calc, 0, actual_limit_kw)
+            unserved = max(0.0, p_DC - p_PV - p_ref - actual_limit_kw)
         else:
             p_grid   = 0.0
             # Grid down: PV and battery must cover DC
@@ -154,6 +163,11 @@ class ComponentControlLayer:
         
         # Calculate effective CI of DC consumption
         total_dc_carbon = (CI_grid * p_grid_to_DC + CI_battery_prev * p_bess_to_DC) * dt
+        # unserved covered by backup generator?
+        if getattr(sys_config, 'enable_backup_generator', True) and unserved > 0:
+            # Assume 600 gCO2/kWh for backup generator
+            total_dc_carbon += (600.0 * unserved) * dt
+
         CI_DC_consumption = total_dc_carbon / (p_DC * dt) if p_DC > 0.01 else CI_grid
 
         return ComponentState(

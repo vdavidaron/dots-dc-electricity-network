@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from enum import Enum
 from typing import Optional
 
 import numpy as np
@@ -38,17 +37,20 @@ class SystemConfig:
     w_carbon: float = 1.0
     w_effort: float = 0.01
     w_soc_low: float = 1e6
+    soc_baseline: float = 50.0  # Soft SOC target [%]
+
+    # Simulation toggles
+    enable_battery: bool = True
+    enable_backup_generator: bool = True
+    enable_renewable_service: bool = True
+    enable_change_management: bool = True
+    enable_goal_management: bool = True
 
 # ── Shared types ──────────────────────────────────────────────────────────────
-
-class OperationMode(Enum):
-    CARBON_MINIMISE = "carbon"
-    NONFIRM         = "nonfirm"
 
 
 @dataclass
 class Goals:
-    mode:           OperationMode
     SOC_target_end: float           # Desired SOC at end of horizon [%]
     CI_grid:        pd.Series       # 24h carbon intensity [gCO2/kWh]
     grid_available: pd.Series       # 24h grid availability [bool]
@@ -70,15 +72,10 @@ class GoalManagementLayer:
     Slow MAPE-K loop.
     Runs every morning to produce a day-ahead Goals + SchedulePlan via PuLP LP.
 
-    Scenarios
-    ---------
-    carbon  → minimise total Scope 2 CO2 emissions
-    nonfirm → minimise unserved load during grid outages (feasibility first)
+    The objective function is fully weight-driven from ESDL configuration.
     """
 
-    def __init__(self, scenario: str = "carbon"):
-        assert scenario in ["carbon", "nonfirm"], f"Unknown scenario: {scenario}"
-        self.scenario  = scenario
+    def __init__(self):
         self.goals:    Optional[Goals]        = None
         self.current_schedule:     Optional[SchedulePlan] = None
         # ── Knowledge store ──
@@ -98,34 +95,24 @@ class GoalManagementLayer:
     # ── Analyze ───────────────────────────────────────────────────────────────
 
     def analyze(self, forecast: dict, sys_config: SystemConfig) -> Goals:
-        """Select operation mode and compute SOC target."""
+        """Compute SOC target from forecast."""
         CI_grid        = forecast["CI_grid"]
         grid_available = forecast["grid_available"]
         p_DC           = forecast["p_DC"]
         p_PV           = forecast.get("p_PV", pd.Series([0.0]*len(p_DC), index=p_DC.index))
 
-        mode_map = {
-            "carbon":  OperationMode.CARBON_MINIMISE,
-            "nonfirm": OperationMode.NONFIRM,
-        }
-        mode = mode_map[self.scenario]
-
-        if mode == OperationMode.NONFIRM:
-            outage_hours  = int((~grid_available).sum())
-            energy_needed = max(0, (p_DC - p_PV).mean()) * outage_hours          # kWh
-            
-            if sys_config.E_BAT > 0:
-                soc_target = min(
-                    sys_config.SOC_MAX,
-                    sys_config.SOC_MIN + (energy_needed / sys_config.E_BAT) * 100.0
-                )
-            else:
-                soc_target = 0.0
+        outage_hours  = int((~grid_available).sum())
+        energy_needed = max(0, (p_DC - p_PV).mean()) * outage_hours          # kWh
+        
+        if sys_config.E_BAT > 0:
+            soc_target = min(
+                sys_config.SOC_MAX,
+                sys_config.SOC_MIN + (energy_needed / sys_config.E_BAT) * 100.0
+            )
         else:
-            soc_target = 50.0
+            soc_target = 0.0
 
         goals = Goals(
-            mode=mode,
             SOC_target_end=soc_target,
             CI_grid=CI_grid,
             grid_available=grid_available,
@@ -133,7 +120,7 @@ class GoalManagementLayer:
             p_PV=p_PV,
         )
         self._knowledge["goals"] = goals
-        print(f"[GoalMgmt | Analyze] mode={mode.value}  SOC_target={soc_target:.1f}%")
+        print(f"[GoalMgmt | Analyze] SOC_target={soc_target:.1f}%")
         return goals
 
     # ── Plan (PuLP LP) ────────────────────────────────────────────────────────
@@ -167,28 +154,15 @@ class GoalManagementLayer:
         w_effort   = sys_config.w_effort
         w_soc_low  = sys_config.w_soc_low
 
-        if goals.mode == OperationMode.CARBON_MINIMISE:
-            # Standard carbon mode — now with penalties to ensure service reliability and recharging
-            prob += (
-                w_unserved * pulp.lpSum(unserved[t] for t in range(n))
-                + w_soc_low * pulp.lpSum(soc_slack[t] for t in range(n))
-                + pulp.lpSum(
-                    goals.CI_grid.iloc[t] * p_grid[t] * dt
-                    for t in range(n)
-                )
-                + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
+        prob += (
+            w_unserved * pulp.lpSum(unserved[t] for t in range(n))
+            + w_soc_low  * pulp.lpSum(soc_slack[t] for t in range(n))
+            + w_carbon   * pulp.lpSum(
+                goals.CI_grid.iloc[t] * p_grid[t] * dt
+                for t in range(n)
             )
-
-        elif goals.mode == OperationMode.NONFIRM:
-            prob += (
-                w_unserved * pulp.lpSum(unserved[t] for t in range(n))
-                + w_soc_low  * pulp.lpSum(soc_slack[t] for t in range(n))
-                + w_carbon   * pulp.lpSum(
-                    goals.CI_grid.iloc[t] * p_grid[t] * dt
-                    for t in range(n)
-                )
-                + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
-            )
+            + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
+        )
 
         # ── Constraints ───────────────────────────────────────────────────────
         for t in range(n):
@@ -212,10 +186,9 @@ class GoalManagementLayer:
                 prob += p_ch[t] == 0.0
                 prob += p_dch[t] == 0.0
 
-            # Soft SOC target: prefer keeping SOC above a baseline (e.g. 50% in carbon mode, 70% in nonfirm)
+            # Soft SOC target: prefer keeping SOC above the configurable baseline
             if sys_config.E_BAT > 0.0:
-                soc_baseline = 70.0 if goals.mode == OperationMode.NONFIRM else 50.0
-                prob += soc[t] + soc_slack[t] >= soc_baseline
+                prob += soc[t] + soc_slack[t] >= sys_config.soc_baseline
 
             # Grid limits and balance
             # p_grid_t must satisfy the energy balance (allow PV curtailment if p_grid_t >= 0 and RHS < 0)

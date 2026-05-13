@@ -18,10 +18,7 @@ requests.Session.request = _patched_request
 from esdl import esdl, EnergySystem
 import helics as h
 
-from dots_infrastructure.DataClasses import (
-    EsdlId, TimeStepInformation, HelicsCalculationInformation, 
-    SubscriptionDescription, PublicationDescription
-)
+from dots_infrastructure.DataClasses import EsdlId, TimeStepInformation
 from dots_infrastructure.Logger import LOGGER
 from dots_infrastructure import CalculationServiceHelperFunctions
 
@@ -48,10 +45,8 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
     """
 
     def __init__(self):
+        super().__init__()
         from dots_infrastructure.influxdb_connector import InfluxDBConnector
-        self.simulator_configuration = CalculationServiceHelperFunctions.get_simulator_configuration_from_environment()
-        self.calculations = []
-        self.energy_system = None
         self.influx_connector = InfluxDBConnector(
             self.simulator_configuration.influx_host, 
             self.simulator_configuration.influx_port, 
@@ -59,61 +54,10 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             self.simulator_configuration.influx_password, 
             self.simulator_configuration.influx_database_name
         )
-        self.esdl_obj_mapping = {}
         self.current_soc = 50.0
 
         # ── Forecast error model ───────────────────────────────
         self._forecast_error = ForecastErrorModel()
-
-        # ── Custom Calculation Setup ─────────────────────────────
-        da_inputs = [
-            SubscriptionDescription(esdl_type="PowerPlant", input_name="power_limit_plan_DA", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
-            SubscriptionDescription(esdl_type="PowerPlant", input_name="mandated_min_power_draw_DA", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
-            SubscriptionDescription(esdl_type="PowerPlant", input_name="carbon_intensity_plan_DA", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
-            SubscriptionDescription(esdl_type="ElectricityDemand", input_name="demand_power_plan_da", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
-            SubscriptionDescription(esdl_type="PVInstallation", input_name="planned_generation_DA", input_unit="VECTOR", input_type=h.HelicsDataType.VECTOR),
-        ]
-        da_info = HelicsCalculationInformation(
-            time_period_in_seconds=86400,
-            offset=2,
-            uninterruptible=False,
-            wait_for_current_time_update=False,
-            terminate_on_error=True,
-            calculation_name="day_ahead_routing",
-            inputs=da_inputs,
-            outputs=[],
-            calculation_function=self.day_ahead_routing
-        )
-        self.add_calculation(da_info)
-
-        dispatch_inputs = [
-            SubscriptionDescription(esdl_type="ElectricityDemand", input_name="demand_power_w", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
-            SubscriptionDescription(esdl_type="Battery", input_name="state_of_charge", input_unit="pct", input_type=h.HelicsDataType.DOUBLE),
-            SubscriptionDescription(esdl_type="Battery", input_name="bess_power_w", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
-            SubscriptionDescription(esdl_type="PowerPlant", input_name="actual_power_limit_ID", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
-            SubscriptionDescription(esdl_type="PowerPlant", input_name="actual_carbon_intensity_ID", input_unit="gCO2/kWh", input_type=h.HelicsDataType.DOUBLE),
-            SubscriptionDescription(esdl_type="PowerPlant", input_name="mandated_min_power_draw_ID", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
-            SubscriptionDescription(esdl_type="PVInstallation", input_name="potential_available_generation_ID", input_unit="W", input_type=h.HelicsDataType.DOUBLE),
-        ]
-        
-        dispatch_outputs = [
-            PublicationDescription(global_flag=True, esdl_type="ElectricityNetwork", output_name="bess_allocation_w", output_unit="W", data_type=h.HelicsDataType.DOUBLE),
-            PublicationDescription(global_flag=True, esdl_type="ElectricityNetwork", output_name="grid_allocation_w", output_unit="W", data_type=h.HelicsDataType.DOUBLE),
-            PublicationDescription(global_flag=True, esdl_type="ElectricityNetwork", output_name="current_max_power_limit", output_unit="W", data_type=h.HelicsDataType.DOUBLE),
-            PublicationDescription(global_flag=True, esdl_type="ElectricityNetwork", output_name="backup_requested_power", output_unit="W", data_type=h.HelicsDataType.DOUBLE),
-        ]
-        dispatch_info = HelicsCalculationInformation(
-            time_period_in_seconds=900,
-            offset=10,
-            uninterruptible=False,
-            wait_for_current_time_update=False,
-            terminate_on_error=True,
-            calculation_name="network_dispatch",
-            inputs=dispatch_inputs,
-            outputs=dispatch_outputs,
-            calculation_function=self.network_dispatch
-        )
-        self.add_calculation(dispatch_info)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -134,6 +78,18 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         # Refresh from ESDL
         self._refresh_system_params(energy_system)
 
+        # Save toggle values before reconstructing SystemConfig (which would reset them)
+        _enable_battery = getattr(self.sys_config, 'enable_battery', True)
+        _enable_backup_generator = getattr(self.sys_config, 'enable_backup_generator', True)
+        _enable_renewable_service = getattr(self.sys_config, 'enable_renewable_service', True)
+        _enable_change_management = getattr(self.sys_config, 'enable_change_management', True)
+        _enable_goal_management = getattr(self.sys_config, 'enable_goal_management', True)
+        _w_unserved = getattr(self.sys_config, 'w_unserved', 1e9)
+        _w_carbon = getattr(self.sys_config, 'w_carbon', 1.0)
+        _w_effort = getattr(self.sys_config, 'w_effort', 0.01)
+        _w_soc_low = getattr(self.sys_config, 'w_soc_low', 1e6)
+        _soc_baseline = getattr(self.sys_config, 'soc_baseline', 50.0)
+
         self.sys_config = SystemConfig(
             dt=0.25, 
             E_BAT=self.sys_config.E_BAT if hasattr(self, 'sys_config') else 0.0, 
@@ -144,6 +100,24 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             SOC_MAX=100.0
         )
 
+        # Re-apply toggles and weights
+        self.sys_config.enable_battery = _enable_battery
+        self.sys_config.enable_backup_generator = _enable_backup_generator
+        self.sys_config.enable_renewable_service = _enable_renewable_service
+        self.sys_config.enable_change_management = _enable_change_management
+        self.sys_config.enable_goal_management = _enable_goal_management
+        self.sys_config.w_unserved = _w_unserved
+        self.sys_config.w_carbon = _w_carbon
+        self.sys_config.w_effort = _w_effort
+        self.sys_config.w_soc_low = _w_soc_low
+        self.sys_config.soc_baseline = _soc_baseline
+
+        # Handle battery baseline: zero out all battery parameters
+        if not self.sys_config.enable_battery:
+            self.sys_config.E_BAT = 0.0
+            self.sys_config.P_CH_MAX = 0.0
+            self.sys_config.P_DCH_MAX = 0.0
+
         LOGGER.info(
             "SystemConfig: dt=%.2f  E_BAT=%.1f kWh  P_CH=%.1f kW  P_DCH=%.1f kW  "
             "P_GRID=%.1f kW  SOC=[%.0f,%.0f]%%  EFF_CH=%.2f  EFF_DCH=%.2f",
@@ -153,10 +127,17 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             self.sys_config.SOC_MIN, self.sys_config.SOC_MAX,
             self.sys_config.EFF_CH, self.sys_config.EFF_DCH,
         )
+        LOGGER.info(
+            "Toggles: battery=%s  backup=%s  renewable=%s  change_mgmt=%s  goal_mgmt=%s",
+            self.sys_config.enable_battery, self.sys_config.enable_backup_generator,
+            self.sys_config.enable_renewable_service, self.sys_config.enable_change_management,
+            self.sys_config.enable_goal_management,
+        )
 
         # Layers
-        self.goal_layer    = GoalManagementLayer(scenario="nonfirm")
+        self.goal_layer    = GoalManagementLayer()
         self.change_layer  = ChangeManagementLayer()
+
         self.control_layer = ComponentControlLayer()
 
         self.current_day_step_idx = 0
@@ -228,7 +209,22 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                 float(forecast["p_PV"].mean())
             )
 
-            goals, plan = self.goal_layer.execute(forecast, self.sys_config, soc_init=self.current_soc)
+            if getattr(self.sys_config, 'enable_goal_management', True):
+                goals, plan = self.goal_layer.execute(forecast, self.sys_config, soc_init=self.current_soc)
+            else:
+                LOGGER.info("[DA thread] Goal Management disabled. Generating flat baseline plan.")
+                goals = Goals(
+                    SOC_target_end=self.current_soc,
+                    CI_grid=forecast["CI_grid"],
+                    grid_available=forecast["grid_available"],
+                    p_DC=forecast["p_DC"],
+                    p_PV=forecast["p_PV"]
+                )
+                flat_p_ch_b = pd.Series([0.0] * n, index=forecast["CI_grid"].index)
+                target_soc = 0.0 if self.sys_config.E_BAT == 0.0 else self.current_soc
+                flat_soc = pd.Series([target_soc] * n, index=forecast["CI_grid"].index)
+                plan = SchedulePlan(p_ch_b=flat_p_ch_b, SOC_plan=flat_soc, source="baseline")
+
             self._pending_da_result = (goals, plan)
 
             # ── LOG Full Future DA Plan ──────────────────────────────────────
@@ -350,8 +346,21 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         pv_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "potential_available_generation_ID")
         pv_kw = (pv_val / 1000.0) if pv_val is not None else 0.0
 
+        # Zero out PV if renewable service is disabled
+        if not getattr(self.sys_config, 'enable_renewable_service', True):
+            pv_kw = 0.0
+
+        backup_supplied_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "backup_supplied_power")
+        if backup_supplied_val is not None:
+            self._state_cache["backup_supplied_power"] = backup_supplied_val
+        backup_max_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "available_max_power")
+        if backup_max_val is not None:
+            self._state_cache["available_max_power"] = backup_max_val
+
         limit_w      = self._state_cache["actual_power_limit_ID"]
         ci_val       = self._state_cache["actual_carbon_intensity_ID"]
+        backup_supplied_w = self._state_cache.get("backup_supplied_power", 0.0)
+        backup_max_w     = self._state_cache.get("available_max_power", 0.0)
         
         grid_available = limit_w > 0.0
         p_dc_kw = demand_w / 1_000.0
@@ -371,7 +380,12 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             
             # Monitoring & Analysis
             state = self.change_layer.monitor(step, soc_actual, grid_available, p_dc_actual_kw=p_dc_kw)
-            event = self.change_layer.analyze(state)
+            
+            if getattr(self.sys_config, 'enable_change_management', True):
+                event = self.change_layer.analyze(state)
+            else:
+                # Bypass change management — DeviationEvent already imported at top
+                event = DeviationEvent(step, soc_actual, float(self.change_layer.plan.SOC_plan.iloc[step]), 0.0, False, 0.0, False, False)
             
             # Forecast extraction for logging
             planned_soc = float(self.change_layer.plan.SOC_plan.iloc[step])
@@ -399,7 +413,17 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             setpoint_kw = self._heuristic_fallback(soc_actual, limit_w, demand_w, pv_kw)
 
         # ── 3. EXECUTION ──
-        exec_state = self.control_layer.execute_step(setpoint_kw, soc_actual, grid_available, p_dc_kw, ci_val, self.sys_config, CI_battery_prev=self.current_ci_battery, p_PV=pv_kw)
+        exec_state = self.control_layer.execute_step(
+            setpoint_kw, 
+            soc_actual, 
+            grid_available, 
+            p_dc_kw, 
+            ci_val, 
+            self.sys_config, 
+            CI_battery_prev=self.current_ci_battery, 
+            p_PV=pv_kw,
+            p_grid_limit_kw=(limit_w / 1000.0)
+        )
         
         self.current_day_step_idx += 1
         self.current_ci_battery = exec_state.CI_battery
@@ -407,7 +431,23 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         # BESS Allocation: (+ discharge / - charge)
         bess_w = exec_state.p_ch_b * 1000.0
         grid_w = exec_state.p_grid * 1000.0
-        backup_w = exec_state.unserved * 1000.0
+        unserved_kw = exec_state.unserved  # kW of DC load that could not be served
+        
+        # Force battery setpoint to zero if battery is disabled
+        if not getattr(self.sys_config, 'enable_battery', True):
+            bess_w = 0.0
+        
+        # Calculate served/unserved power and backup dispatch
+        if getattr(self.sys_config, 'enable_backup_generator', True):
+            # Backup generator covers any shortfall → no outage
+            backup_w = unserved_kw * 1000.0  # Request backup to cover unserved
+            served_power_w = demand_w
+            unserved_outage_w = 0.0
+        else:
+            # No backup → unserved power IS the outage
+            backup_w = 0.0
+            unserved_outage_w = unserved_kw * 1000.0
+            served_power_w = max(0.0, demand_w - unserved_outage_w)
 
         # ── 4. COMPREHENSIVE LOGGING ──
         
@@ -421,6 +461,10 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Requested_Power_W", simulation_time, backup_w)
         self.influx_connector.set_time_step_data_point(esdl_id, "Total_Routed_Demand_W", simulation_time, demand_w)
         self.influx_connector.set_time_step_data_point(esdl_id, "PV_Generation_W", simulation_time, pv_kw * 1000.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "served_datacenter_power_w", simulation_time, served_power_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Unserved_Datacenter_Power_W", simulation_time, unserved_outage_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Supplied_Power_W", simulation_time, backup_supplied_w)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Max_Capacity_W", simulation_time, backup_max_w)
         
         # Carbon Metrics
         self.influx_connector.set_time_step_data_point(esdl_id, "Total_Carbon_g", simulation_time, exec_state.carbon)
@@ -472,6 +516,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             grid_allocation_w=grid_w,
             current_max_power_limit=pv_curtailment_limit_w,
             backup_requested_power=backup_w,
+            served_datacenter_power_w=served_power_w,
         )
 
     # ── Helpers ──────────────────────────────────────────────────────────────
@@ -508,6 +553,19 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                                 self.sys_config.w_effort = float(kpi.value)
                             elif kpi.name == "w_soc_low":
                                 self.sys_config.w_soc_low = float(kpi.value)
+                            elif kpi.name == "soc_baseline":
+                                self.sys_config.soc_baseline = float(kpi.value)
+
+                            elif kpi.name == "enable_battery":
+                                self.sys_config.enable_battery = bool(float(kpi.value))
+                            elif kpi.name == "enable_backup_generator":
+                                self.sys_config.enable_backup_generator = bool(float(kpi.value))
+                            elif kpi.name == "enable_renewable_service":
+                                self.sys_config.enable_renewable_service = bool(float(kpi.value))
+                            elif kpi.name == "enable_change_management":
+                                self.sys_config.enable_change_management = bool(float(kpi.value))
+                            elif kpi.name == "enable_goal_management":
+                                self.sys_config.enable_goal_management = bool(float(kpi.value))
 
             elif eClass.name == "ElectricityDemand":
                 self.dc_base_load_w = float(getattr(obj, "power", 4000000.0))

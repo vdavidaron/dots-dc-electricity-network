@@ -18,7 +18,7 @@ from esdl.esdl_handler import EnergySystemHandler
 import helics as h
 
 from three_layer_mape.layers.goal_management import (
-    GoalManagementLayer, SystemConfig, Goals, SchedulePlan, OperationMode
+    GoalManagementLayer, SystemConfig, Goals, SchedulePlan
 )
 from three_layer_mape.layers.change_management import ChangeManagementLayer, DeviationEvent
 from three_layer_mape.layers.component_control import ComponentControlLayer
@@ -73,12 +73,11 @@ class TestGoalManagementLayer(unittest.TestCase):
         Crucially, the sign must match ComponentControlLayer expectations.
         """
         cfg = _test_sys_config()
-        layer = GoalManagementLayer(scenario="carbon")
+        layer = GoalManagementLayer()
         forecast = _simple_forecast()
 
         goals, plan = layer.execute(forecast, cfg, soc_init=50.0)
 
-        self.assertEqual(goals.mode, OperationMode.CARBON_MINIMISE)
         self.assertEqual(len(plan.p_ch_b), 96)
         self.assertEqual(plan.source, "lp")
 
@@ -94,7 +93,7 @@ class TestGoalManagementLayer(unittest.TestCase):
         Verify the sign convention is correct.
         """
         cfg = _test_sys_config()
-        layer = GoalManagementLayer(scenario="carbon")
+        layer = GoalManagementLayer()
 
         n = 96
         # Create a CI profile with a clear low-CI window (steps 20-40)
@@ -128,7 +127,7 @@ class TestGoalManagementLayer(unittest.TestCase):
     def test_lp_feasible_with_esdl_scale_params(self):
         """Ensure the LP is feasible with ESDL-scale parameters (MW, not kW)."""
         cfg = _test_sys_config()
-        layer = GoalManagementLayer(scenario="carbon")
+        layer = GoalManagementLayer()
         forecast = _simple_forecast()
 
         goals, plan = layer.execute(forecast, cfg, soc_init=50.0)
@@ -141,7 +140,7 @@ class TestGoalManagementLayer(unittest.TestCase):
     def test_lp_nonfirm_with_outage(self):
         """Non-firm mode should pre-charge before an outage window."""
         cfg = _test_sys_config()
-        layer = GoalManagementLayer(scenario="nonfirm")
+        layer = GoalManagementLayer()
 
         n = 96
         avail = [True] * n
@@ -157,7 +156,6 @@ class TestGoalManagementLayer(unittest.TestCase):
 
         goals, plan = layer.execute(forecast, cfg, soc_init=50.0)
 
-        self.assertEqual(goals.mode, OperationMode.NONFIRM)
         # SOC should be high before outage (pre-charged)
         soc_before_outage = plan.SOC_plan.iloc[59]
         self.assertGreaterEqual(soc_before_outage, 60.0,
@@ -178,7 +176,7 @@ class TestChangeManagementLayer(unittest.TestCase):
     def _load_plan(self) -> tuple[ChangeManagementLayer, Goals, SchedulePlan]:
         """Create a change management layer with a loaded day-ahead plan."""
         cfg = _test_sys_config()
-        goal_layer = GoalManagementLayer(scenario="carbon")
+        goal_layer = GoalManagementLayer()
         forecast = _simple_forecast()
         goals, plan = goal_layer.execute(forecast, cfg, soc_init=50.0)
 
@@ -518,7 +516,6 @@ class TestNetworkBalancerIntegration(unittest.TestCase):
             source="test"
         )
         goals = Goals(
-            mode=OperationMode.CARBON_MINIMISE,
             SOC_target_end=50.0,
             CI_grid=pd.Series([250.0] * n),
             grid_available=pd.Series([True] * n),
