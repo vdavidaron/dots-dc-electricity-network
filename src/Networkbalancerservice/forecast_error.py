@@ -35,14 +35,18 @@
 #
 # Reproducibility
 # ---------------
-# The RNG is seeded from the env variable SIMULATION_SEED (default 42).
-# Set FORECAST_SEED separately to vary forecast error independently of other
-# stochastic components.
+# All four tunable parameters of this model — the three relative-σ values and the
+# RNG seed — are exposed as ESDL DoubleKPI attributes on the ElectricityNetwork
+# asset (forecast_sigma_ci, forecast_sigma_p_dc, forecast_sigma_price,
+# forecast_seed) and read by the Network Balancer at federate initialisation.
+# This lets each experimental run select its own forecast-uncertainty profile
+# without rebuilding any service container. The literature-calibrated defaults
+# below act only as a fallback when the model is instantiated outside the ESDL
+# path (e.g., the standalone three_layer_mape harness).
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
 
-import os
 import logging
 import numpy as np
 import pandas as pd
@@ -50,19 +54,23 @@ import pandas as pd
 LOGGER = logging.getLogger(__name__)
 
 
-# ── Default relative standard deviations (literature-calibrated) ──────────────
+# ── Fallback relative standard deviations (literature-calibrated) ────────────
+# These are used only when the constructor is called with no explicit sigmas.
+# Production runs receive sigmas from the ESDL via the Network Balancer.
 
-_DEFAULT_SIGMA = {
+_FALLBACK_SIGMA = {
     "CI_grid":  0.12,   # 12 % — ENTSO-E / Staffell & Pfenninger (2016)
     "p_DC":     0.05,   # 5 %  — Pelley et al. (2009)
     "price_E":  0.15,   # 15 % — Weron (2014) day-ahead EPEX SPOT NL
 }
 
-# Physical lower bounds — a perturbed forecast must stay above these
+# Physical / market lower bounds — perturbed forecasts must stay above these.
+# These are not ESDL-configurable because they encode genuine physical or
+# market-rule constraints rather than modelling assumptions.
 _LOWER_BOUND = {
     "CI_grid":  10.0,   # gCO2/kWh — practically zero-carbon floor
     "p_DC":     0.0,    # kW      — demand cannot be negative
-    "price_E":  -500.0, # EUR/MWh — NL day-ahead can go negative, but bounded
+    "price_E":  -500.0, # EUR/MWh — EPEX SPOT NL day-ahead technical floor
 }
 
 
@@ -74,35 +82,38 @@ class ForecastErrorModel:
         forecast[t] = actual[t] * (1 + ε[t])
         ε[t] ~ N(0, σ_rel²)   i.i.d. per timestep and per signal
 
-    where σ_rel is the relative standard deviation taken from the literature.
+    where σ_rel is the relative standard deviation supplied by the caller
+    (typically the Network Balancer reading the ESDL).
 
     Parameters
     ----------
     seed : int, optional
-        RNG seed for reproducibility.  Defaults to env FORECAST_SEED → 42.
-    sigma_overrides : dict, optional
-        Override any default σ_rel value for sensitivity analysis, e.g.
-        {"CI_grid": 0.20} to test a high-uncertainty carbon scenario.
+        RNG seed for reproducibility. Defaults to 42 when not supplied.
+    sigma_ci, sigma_p_dc, sigma_price : float, optional
+        Relative standard deviations per signal. Each defaults to its
+        literature-calibrated fallback value (see _FALLBACK_SIGMA) when not
+        supplied; production callers should pass the ESDL-driven values.
     """
 
     def __init__(
         self,
-        seed: int | None = None,
-        sigma_overrides: dict[str, float] | None = None,
+        seed: int = 42,
+        sigma_ci:    float | None = None,
+        sigma_p_dc:  float | None = None,
+        sigma_price: float | None = None,
     ):
-        if seed is None:
-            seed = int(os.environ.get("FORECAST_SEED", os.environ.get("SIMULATION_SEED", 42)))
-        self._rng = np.random.default_rng(seed)
-
-        self._sigma = {**_DEFAULT_SIGMA}
-        if sigma_overrides:
-            self._sigma.update(sigma_overrides)
-
+        self._rng = np.random.default_rng(int(seed))
+        self._sigma = {
+            "CI_grid": _FALLBACK_SIGMA["CI_grid"] if sigma_ci    is None else float(sigma_ci),
+            "p_DC":    _FALLBACK_SIGMA["p_DC"]    if sigma_p_dc  is None else float(sigma_p_dc),
+            "price_E": _FALLBACK_SIGMA["price_E"] if sigma_price is None else float(sigma_price),
+        }
         LOGGER.info(
-            "[ForecastError] Initialized — seed=%d  σ(CI)=%.0f%%  σ(DC)=%.0f%%",
-            seed,
+            "[ForecastError] Initialised — seed=%d  σ(CI)=%.1f%%  σ(p_DC)=%.1f%%  σ(price)=%.1f%%",
+            int(seed),
             self._sigma["CI_grid"] * 100,
             self._sigma["p_DC"] * 100,
+            self._sigma["price_E"] * 100,
         )
 
     # ── Public API ────────────────────────────────────────────────────────────

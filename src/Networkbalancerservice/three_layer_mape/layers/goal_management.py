@@ -40,12 +40,26 @@ class SystemConfig:
     w_soc_low: float = 1e6
     soc_baseline: float = 50.0  # Soft SOC target [%]
 
+    # Change Management (MPC) deviation thresholds — read from ESDL KPIs
+    mpc_soc_drift_threshold: float = 5.0       # [%] replan if |SOC_actual - SOC_planned| exceeds this
+    mpc_demand_spike_threshold: float = 0.10   # [fraction] replan if actual_demand > forecast by this fraction
+    mpc_horizon_steps: int = 24                # [steps] rolling horizon length (24 × 15min = 6h)
+    mpc_replan_cooldown: int = 4               # [steps] minimum gap between successive replans (4 × 15min = 1h)
+
+    # Forecast-error model parameters — read from ESDL KPIs.
+    # See forecast_error.py for literature calibration of the defaults.
+    forecast_sigma_ci:    float = 0.12         # [fraction] relative σ for CI forecast (Staffell & Pfenninger 2016)
+    forecast_sigma_p_dc:  float = 0.05         # [fraction] relative σ for demand forecast (Pelley et al. 2009)
+    forecast_sigma_price: float = 0.15         # [fraction] relative σ for price forecast (Weron 2014)
+    forecast_seed:        int   = 42           # RNG seed; vary across runs for Monte-Carlo, fix for reproducibility
+
     # Simulation toggles
     enable_battery: bool = True
     enable_backup_generator: bool = True
     enable_renewable_service: bool = True
     enable_change_management: bool = True
     enable_goal_management: bool = True
+    enable_mandate: bool = True   # if False, the grid's mandated-min-power-draw signal is ignored
 
 # ── Shared types ──────────────────────────────────────────────────────────────
 
@@ -108,9 +122,15 @@ class GoalManagementLayer:
         energy_needed = max(0, (p_DC - p_PV).mean()) * outage_hours          # kWh
 
         if sys_config.E_BAT > 0:
+            # Floor at soc_baseline so the daily LP behaves as a closed cycle
+            # (start ~= end). Without this floor the terminal constraint pins
+            # SOC to ~SOC_MIN whenever no outages are forecast, which makes
+            # the LP carry no energy across midnight even when day-2's morning
+            # ramp is foreseeably high-CI.
+            outage_reserve = sys_config.SOC_MIN + (energy_needed / sys_config.E_BAT) * 100.0
             soc_target = min(
                 sys_config.SOC_MAX,
-                sys_config.SOC_MIN + (energy_needed / sys_config.E_BAT) * 100.0
+                max(sys_config.soc_baseline, outage_reserve)
             )
         else:
             soc_target = 0.0
@@ -161,6 +181,18 @@ class GoalManagementLayer:
 
         price = goals.price_E if goals.price_E is not None else pd.Series([0.0] * n, index=T)
 
+        # Future-value-of-SOC: reward residual energy at end-of-horizon.
+        # This is a Bellman-style approximation of "energy stored at midnight
+        # saves emissions/cost in the morning ramp on day 2." The shadow price
+        # is calibrated against the daily mean carbon intensity so the LP
+        # values 1pp of terminal SOC roughly as much as the average gCO2
+        # that 1pp would have displaced in the next 4 hours.
+        mean_ci = float(goals.CI_grid.mean()) if len(goals.CI_grid) else 0.0
+        mean_pr = float(price.mean()) if len(price) else 0.0
+        # 1pp of SOC = E_BAT/100 kWh; discharged at eta_dch yields E_BAT*eta/100 kWh delivered.
+        shadow_carbon = w_carbon * mean_ci    * (sys_config.E_BAT / 100.0) * sys_config.EFF_DCH
+        shadow_price  = w_price  * mean_pr    * (sys_config.E_BAT / 100.0) * sys_config.EFF_DCH
+
         prob += (
             w_unserved * pulp.lpSum(unserved[t] for t in range(n))
             + w_soc_low  * pulp.lpSum(soc_slack[t] for t in range(n))
@@ -173,6 +205,7 @@ class GoalManagementLayer:
                 for t in range(n)
             )
             + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
+            - (shadow_carbon + shadow_price) * soc[n - 1]
         )
 
         # ── Constraints ───────────────────────────────────────────────────────
@@ -204,9 +237,18 @@ class GoalManagementLayer:
             # Grid limits and balance
             # p_grid_t must satisfy the energy balance (allow PV curtailment if p_grid_t >= 0 and RHS < 0)
             prob += p_grid[t] >= p_dc_t - p_pv_t + p_ch[t] - p_dch[t] - unserved[t]
-            
+
             if not avail:
                 prob += p_grid[t] == 0
+            else:
+                # When the grid is forecast-available, demand satisfaction is by
+                # ASSUMPTION (firm-grid scenario). The unserved slack is then a
+                # structural artefact that the LP would otherwise use as a free
+                # escape valve under low w_unserved. Hard-pin it to zero so the
+                # LP is forced to serve demand from {grid, battery, PV} only.
+                # Unserved is permitted only during forecast outages (above
+                # branch), where w_unserved governs how much reserve to plan.
+                prob += unserved[t] == 0
 
 
         # End-of-day SOC target (soft: within ±10%)

@@ -57,6 +57,8 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.current_soc = 50.0
 
         # ── Forecast error model ───────────────────────────────
+        # Constructed for real in init_calculation_service() once the ESDL
+        # KPIs have been parsed; until then, a fallback model is in place.
         self._forecast_error = ForecastErrorModel()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -90,6 +92,15 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         _w_effort = getattr(self.sys_config, 'w_effort', 0.01)
         _w_soc_low = getattr(self.sys_config, 'w_soc_low', 1e6)
         _soc_baseline = getattr(self.sys_config, 'soc_baseline', 50.0)
+        _enable_mandate = getattr(self.sys_config, 'enable_mandate', True)
+        _mpc_soc_drift   = getattr(self.sys_config, 'mpc_soc_drift_threshold', 5.0)
+        _mpc_demand_spike = getattr(self.sys_config, 'mpc_demand_spike_threshold', 0.10)
+        _mpc_horizon     = getattr(self.sys_config, 'mpc_horizon_steps', 24)
+        _mpc_cooldown    = getattr(self.sys_config, 'mpc_replan_cooldown', 4)
+        _f_sigma_ci      = getattr(self.sys_config, 'forecast_sigma_ci', 0.12)
+        _f_sigma_p_dc    = getattr(self.sys_config, 'forecast_sigma_p_dc', 0.05)
+        _f_sigma_price   = getattr(self.sys_config, 'forecast_sigma_price', 0.15)
+        _f_seed          = getattr(self.sys_config, 'forecast_seed', 42)
 
         self.sys_config = SystemConfig(
             dt=0.25, 
@@ -113,6 +124,15 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.sys_config.w_effort = _w_effort
         self.sys_config.w_soc_low = _w_soc_low
         self.sys_config.soc_baseline = _soc_baseline
+        self.sys_config.enable_mandate = _enable_mandate
+        self.sys_config.mpc_soc_drift_threshold = _mpc_soc_drift
+        self.sys_config.mpc_demand_spike_threshold = _mpc_demand_spike
+        self.sys_config.mpc_horizon_steps = _mpc_horizon
+        self.sys_config.mpc_replan_cooldown = _mpc_cooldown
+        self.sys_config.forecast_sigma_ci    = _f_sigma_ci
+        self.sys_config.forecast_sigma_p_dc  = _f_sigma_p_dc
+        self.sys_config.forecast_sigma_price = _f_sigma_price
+        self.sys_config.forecast_seed        = _f_seed
 
         # Handle battery baseline: zero out all battery parameters
         if not self.sys_config.enable_battery:
@@ -142,6 +162,16 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
 
         self.control_layer = ComponentControlLayer()
 
+        # Reconstruct the forecast-error model with ESDL-derived parameters
+        # (the __init__-time instance used literature-fallback defaults because
+        # the ESDL hadn't been parsed yet).
+        self._forecast_error = ForecastErrorModel(
+            seed        = self.sys_config.forecast_seed,
+            sigma_ci    = self.sys_config.forecast_sigma_ci,
+            sigma_p_dc  = self.sys_config.forecast_sigma_p_dc,
+            sigma_price = self.sys_config.forecast_sigma_price,
+        )
+
         self.current_day_step_idx = 0
         self._pending_da_result: Optional[Tuple[Goals, SchedulePlan]] = None
         self._mpc_running  = False
@@ -157,6 +187,10 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         # Counterfactual "no-optimisation" baseline: spot-price × instantaneous DC load
         self._cum_baseline_cost_eur = 0.0  # EUR — what DC would have paid at spot
         self._cum_baseline_carbon_g = 0.0  # gCO2 — same baseline for carbon
+
+        # InfluxDB write pacing — see notes at end of _do_network_dispatch
+        self._influx_flush_every_n_steps = 96   # once per simulated day (96 × 15min)
+        self._steps_since_influx_flush  = 0
         
         self._state_cache = {
             "actual_power_limit_ID": self.grid_import_limit_w,
@@ -359,7 +393,13 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
 
         min_mandate_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "mandated_min_power_draw_ID")
         if min_mandate_val is not None:
-            self._state_cache["mandated_min_power_draw_ID"] = min_mandate_val
+            # Honour the ESDL toggle: when mandate is disabled the dispatch
+            # path treats the upstream signal as zero (no surplus-absorption
+            # obligation, no PV curtailment forced by grid surplus).
+            if getattr(self.sys_config, 'enable_mandate', True):
+                self._state_cache["mandated_min_power_draw_ID"] = min_mandate_val
+            else:
+                self._state_cache["mandated_min_power_draw_ID"] = 0.0
 
         ci_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "actual_carbon_intensity_ID")
         if ci_val is not None:
@@ -408,7 +448,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             state = self.change_layer.monitor(step, soc_actual, grid_available, p_dc_actual_kw=p_dc_kw)
             
             if getattr(self.sys_config, 'enable_change_management', True):
-                event = self.change_layer.analyze(state)
+                event = self.change_layer.analyze(state, sys_config=self.sys_config)
             else:
                 # Bypass change management — DeviationEvent already imported at top
                 event = DeviationEvent(step, soc_actual, float(self.change_layer.plan.SOC_plan.iloc[step]), 0.0, False, 0.0, False, False)
@@ -422,10 +462,25 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                 forecast_ci = float(self.change_layer.goals.CI_grid.iloc[step])
                 forecast_grid_avail = bool(self.change_layer.goals.grid_available.iloc[step])
 
-            # Trigger MPC Replanning if needed
-            if event.triggered_replan:
-                LOGGER.info(f"[{simulation_time}] Running MPC replan synchronously.")
-                self._run_mpc_replan(event, simulation_time, esdl_id)
+            # Trigger MPC Replanning if needed. Runs in a daemon thread so the
+            # dispatch step never blocks on the LP subprocess: PuLP-CBC's
+            # `cbc.wait()` has no hard timeout enforcement (the `timeLimit` flag
+            # is only honoured by CBC itself and is unreliable under CPU
+            # pressure), so a synchronous call here can hang the federate and
+            # produce the broker-deadlock signature seen in long simulations.
+            # Side effect: the new plan becomes visible to the *next* dispatch
+            # step rather than this one. The two-second worst-case delay is
+            # acceptable on a 15-minute control cadence.
+            if event.triggered_replan and not self._mpc_running:
+                self._mpc_running = True
+                LOGGER.info(f"[{simulation_time}] Dispatching MPC replan thread.")
+                threading.Thread(
+                    target=self._run_mpc_replan,
+                    args=(event, simulation_time, esdl_id),
+                    daemon=True
+                ).start()
+            elif event.triggered_replan and self._mpc_running:
+                LOGGER.debug(f"[{simulation_time}] MPC replan suppressed (previous replan still running).")
             
             # Setpoint extraction
             raw_setpoint = self.change_layer.plan.p_ch_b.iloc[step]
@@ -552,6 +607,14 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         mandate_w = self._state_cache["mandated_min_power_draw_ID"]
         mandatory_grid_import_w = max(0.0, mandate_w)  # only positive = surplus case
 
+        # Sentinel "no curtailment" value. Must be:
+        #   * larger than any physical PV inverter capacity (so it never binds in min()),
+        #   * a finite float64 (so it survives HELICS publish + InfluxDB line-protocol
+        #     serialisation; IEEE-754 inf is a valid double but is rejected by InfluxDB
+        #     line protocol and propagates as NaN through downstream arithmetic).
+        # 1 GW is six orders of magnitude above the 1 MW PV array used in this scenario.
+        PV_CURTAIL_UNCAPPED = 1.0e9
+
         if mandatory_grid_import_w > 0.0:
             # PV can only supply what remains after the mandatory grid import covers DC load.
             # This forces the grid's surplus into the DC + battery.
@@ -561,11 +624,31 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                 mandatory_grid_import_w, pv_curtailment_limit_w, demand_w
             )
         else:
-            # No surplus — PV may generate freely up to physical inverter capacity
-            pv_curtailment_limit_w = float("inf")
+            # No surplus — PV may generate freely up to physical inverter capacity.
+            pv_curtailment_limit_w = PV_CURTAIL_UNCAPPED
 
         self.influx_connector.set_time_step_data_point(esdl_id, "Mandatory_Grid_Import_W", simulation_time, mandatory_grid_import_w)
-        self.influx_connector.set_time_step_data_point(esdl_id, "PV_Curtailment_Limit_W", simulation_time, pv_curtailment_limit_w if pv_curtailment_limit_w != float("inf") else -1.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "PV_Curtailment_Limit_W", simulation_time, pv_curtailment_limit_w)
+
+        # ── Periodic InfluxDB flush ──
+        # The dots_infrastructure connector buffers points in memory and auto-flushes
+        # at MAX_AMOUNT_OF_DB_POINTS = 100 000. With ~30 fields per dispatch step this
+        # accumulates over roughly 35 simulated days, producing a single 100k-point HTTP
+        # POST that can exceed the 5 s requests timeout and stall the federate. Force a
+        # daily flush keeps each batch under ~3 000 points (sub-second writes).
+        self._steps_since_influx_flush += 1
+        if self._steps_since_influx_flush >= self._influx_flush_every_n_steps:
+            try:
+                if self.influx_connector.data_points:
+                    LOGGER.debug(
+                        "[Influx] Periodic flush: %d points",
+                        len(self.influx_connector.data_points),
+                    )
+                    self.influx_connector.write_output()
+                    self.influx_connector.data_points.clear()
+            except Exception as exc:
+                LOGGER.warning("[Influx] Periodic flush failed: %s — buffer retained", exc)
+            self._steps_since_influx_flush = 0
 
         return NetworkDispatchOutput(
             bess_allocation_w=bess_w,
@@ -614,6 +697,24 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                             elif kpi.name == "soc_baseline":
                                 self.sys_config.soc_baseline = float(kpi.value)
 
+                            elif kpi.name == "mpc_soc_drift_threshold":
+                                self.sys_config.mpc_soc_drift_threshold = float(kpi.value)
+                            elif kpi.name == "mpc_demand_spike_threshold":
+                                self.sys_config.mpc_demand_spike_threshold = float(kpi.value)
+                            elif kpi.name == "mpc_horizon_steps":
+                                self.sys_config.mpc_horizon_steps = int(float(kpi.value))
+                            elif kpi.name == "mpc_replan_cooldown":
+                                self.sys_config.mpc_replan_cooldown = int(float(kpi.value))
+
+                            elif kpi.name == "forecast_sigma_ci":
+                                self.sys_config.forecast_sigma_ci = float(kpi.value)
+                            elif kpi.name == "forecast_sigma_p_dc":
+                                self.sys_config.forecast_sigma_p_dc = float(kpi.value)
+                            elif kpi.name == "forecast_sigma_price":
+                                self.sys_config.forecast_sigma_price = float(kpi.value)
+                            elif kpi.name == "forecast_seed":
+                                self.sys_config.forecast_seed = int(float(kpi.value))
+
                             elif kpi.name == "enable_battery":
                                 self.sys_config.enable_battery = bool(float(kpi.value))
                             elif kpi.name == "enable_backup_generator":
@@ -624,6 +725,8 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                                 self.sys_config.enable_change_management = bool(float(kpi.value))
                             elif kpi.name == "enable_goal_management":
                                 self.sys_config.enable_goal_management = bool(float(kpi.value))
+                            elif kpi.name == "enable_mandate":
+                                self.sys_config.enable_mandate = bool(float(kpi.value))
 
             elif eClass.name == "ElectricityDemand":
                 self.dc_base_load_w = float(getattr(obj, "power", 4000000.0))

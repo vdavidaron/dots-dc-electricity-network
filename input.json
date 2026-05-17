@@ -10,12 +10,48 @@
             "offset_in_seconds": 2,
             "description": "Processes DA limits and forecasts, triggers LP optimization.",
             "inputs": [
-                { "name": "power_limit_plan_DA", "esdl_type": "PowerPlant", "data_type": "VECTOR", "description": "Grid limits", "unit": "VECTOR" },
-                { "name": "mandated_min_power_draw_DA", "esdl_type": "PowerPlant", "data_type": "VECTOR", "description": "Grid mandate plan", "unit": "VECTOR" },
-                { "name": "carbon_intensity_plan_DA", "esdl_type": "PowerPlant", "data_type": "VECTOR", "description": "Grid carbon", "unit": "VECTOR" },
-                { "name": "electricity_price_plan_DA", "esdl_type": "PowerPlant", "data_type": "VECTOR", "description": "Grid price forecast", "unit": "VECTOR" },
-                { "name": "demand_power_plan_da", "esdl_type": "ElectricityDemand", "data_type": "VECTOR", "description": "Demand forecast", "unit": "VECTOR" },
-                { "name": "planned_generation_DA", "esdl_type": "PVInstallation", "data_type": "VECTOR", "description": "RES forecast", "unit": "VECTOR" }
+                {
+                    "name": "power_limit_plan_DA",
+                    "esdl_type": "PowerPlant",
+                    "data_type": "VECTOR",
+                    "description": "Grid limits",
+                    "unit": "VECTOR"
+                },
+                {
+                    "name": "mandated_min_power_draw_DA",
+                    "esdl_type": "PowerPlant",
+                    "data_type": "VECTOR",
+                    "description": "Grid mandate plan",
+                    "unit": "VECTOR"
+                },
+                {
+                    "name": "carbon_intensity_plan_DA",
+                    "esdl_type": "PowerPlant",
+                    "data_type": "VECTOR",
+                    "description": "Grid carbon",
+                    "unit": "VECTOR"
+                },
+                {
+                    "name": "electricity_price_plan_DA",
+                    "esdl_type": "PowerPlant",
+                    "data_type": "VECTOR",
+                    "description": "Grid price forecast",
+                    "unit": "VECTOR"
+                },
+                {
+                    "name": "demand_power_plan_da",
+                    "esdl_type": "ElectricityDemand",
+                    "data_type": "VECTOR",
+                    "description": "Demand forecast",
+                    "unit": "VECTOR"
+                },
+                {
+                    "name": "planned_generation_DA",
+                    "esdl_type": "PVInstallation",
+                    "data_type": "VECTOR",
+                    "description": "RES forecast",
+                    "unit": "VECTOR"
+                }
             ],
             "outputs": []
         },
@@ -25,23 +61,94 @@
             "time_period_in_seconds": 900,
             "offset_in_seconds": 10,
             "inputs": [
-                { "name": "demand_power_w", "esdl_type": "ElectricityDemand", "data_type": "DOUBLE", "description": "Total power requested by the datacenter", "unit": "W" },
-                { "name": "state_of_charge", "esdl_type": "Battery", "data_type": "DOUBLE", "description": "BESS SoC", "unit": "pct" },
-                { "name": "bess_power_w", "esdl_type": "Battery", "data_type": "DOUBLE", "description": "BESS actual power", "unit": "W" },
-                { "name": "actual_power_limit_ID", "esdl_type": "PowerPlant", "data_type": "DOUBLE", "description": "Grid limit", "unit": "W" },
-                { "name": "actual_carbon_intensity_ID", "esdl_type": "PowerPlant", "data_type": "DOUBLE", "description": "Grid carbon", "unit": "gCO2/kWh" },
-                { "name": "mandated_min_power_draw_ID", "esdl_type": "PowerPlant", "data_type": "DOUBLE", "description": "Real-time mandate", "unit": "W" },
-                { "name": "actual_electricity_price_ID", "esdl_type": "PowerPlant", "data_type": "DOUBLE", "description": "Real-time electricity price", "unit": "EUR/MWh" },
-                { "name": "potential_available_generation_ID", "esdl_type": "PVInstallation", "data_type": "DOUBLE", "description": "RES potential", "unit": "W" },
-                { "name": "backup_supplied_power", "esdl_type": "GasProducer", "data_type": "DOUBLE", "description": "Backup actual output", "unit": "W" },
-                { "name": "available_max_power", "esdl_type": "GasProducer", "data_type": "DOUBLE", "description": "Backup max capacity", "unit": "W" }
+                {
+                    "name": "demand_power_w",
+                    "esdl_type": "ElectricityDemand",
+                    "data_type": "DOUBLE",
+                    "description": "Total power requested by the datacenter",
+                    "unit": "W"
+                },
+                {
+                    "name": "state_of_charge",
+                    "esdl_type": "Battery",
+                    "data_type": "DOUBLE",
+                    "description": "BESS SoC",
+                    "unit": "pct"
+                },
+                {
+                    "name": "bess_power_w",
+                    "esdl_type": "Battery",
+                    "data_type": "DOUBLE",
+                    "description": "BESS actual power",
+                    "unit": "W"
+                },
+                {
+                    "name": "actual_power_limit_ID",
+                    "esdl_type": "PowerPlant",
+                    "data_type": "DOUBLE",
+                    "description": "Grid limit",
+                    "unit": "W"
+                },
+                {
+                    "name": "actual_carbon_intensity_ID",
+                    "esdl_type": "PowerPlant",
+                    "data_type": "DOUBLE",
+                    "description": "Grid carbon",
+                    "unit": "gCO2/kWh"
+                },
+                {
+                    "name": "mandated_min_power_draw_ID",
+                    "esdl_type": "PowerPlant",
+                    "data_type": "DOUBLE",
+                    "description": "Real-time mandate",
+                    "unit": "W"
+                },
+                {
+                    "name": "actual_electricity_price_ID",
+                    "esdl_type": "PowerPlant",
+                    "data_type": "DOUBLE",
+                    "description": "Real-time electricity price",
+                    "unit": "EUR/MWh"
+                },
+                {
+                    "name": "potential_available_generation_ID",
+                    "esdl_type": "PVInstallation",
+                    "data_type": "DOUBLE",
+                    "description": "RES potential",
+                    "unit": "W"
+                }
             ],
             "outputs": [
-                { "name": "bess_allocation_w", "data_type": "DOUBLE", "description": "Power requested from the battery", "unit": "W" },
-                { "name": "grid_allocation_w", "data_type": "DOUBLE", "description": "Power requested from the grid", "unit": "W" },
-                { "name": "current_max_power_limit", "data_type": "DOUBLE", "description": "Curtailment command for Renewables", "unit": "W" },
-                { "name": "backup_requested_power", "data_type": "DOUBLE", "description": "Generator dispatch command", "unit": "W" },
-                { "name": "served_datacenter_power_w", "data_type": "DOUBLE", "description": "Actual power served to datacenter", "unit": "W" }
+                {
+                    "name": "bess_allocation_w",
+                    "data_type": "DOUBLE",
+                    "description": "Power requested from the battery",
+                    "unit": "W"
+                },
+                {
+                    "name": "grid_allocation_w",
+                    "data_type": "DOUBLE",
+                    "description": "Power requested from the grid",
+                    "unit": "W"
+                },
+                {
+                    "name": "current_max_power_limit",
+                    "data_type": "DOUBLE",
+                    "description": "Curtailment command for Renewables",
+                    "unit": "W"
+                },
+                {
+                    "name": "backup_requested_power",
+                    "data_type": "DOUBLE",
+                    "description": "Generator dispatch command",
+                    "unit": "W"
+                },
+                {
+                    "name": "served_datacenter_power_w",
+                    "data_type": "DOUBLE",
+                    "description": "Actual power served to datacenter",
+                    "unit": "W"
+                }
             ]
         }
     ]

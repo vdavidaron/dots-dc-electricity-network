@@ -15,6 +15,7 @@
 # ────────────────────────────────────────────────────────
 
 from __future__ import annotations
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -57,19 +58,28 @@ class ChangeManagementLayer:
       - Unplanned grid outage detected
     """
 
-    SOC_DRIFT_THRESHOLD    = 5.0   # [%]  — replan if SOC drifts more than this
-    DEMAND_SPIKE_THRESHOLD = 0.10   # [fraction] — replan if actual demand > forecast by 10 %
-    MPC_HORIZON            = 6     # timesteps — rolling window for MPC re-solve
-    REPLAN_COOLDOWN        = 4     # steps to wait between replans (4 × 15min = 1h)
+    # Default thresholds; the live values come from sys_config (ESDL KPIs).
+    # Class constants are kept only as fallback when no sys_config is supplied
+    # to monitor/analyze (e.g., the standalone three_layer_mape harness).
+    SOC_DRIFT_THRESHOLD    = 5.0
+    DEMAND_SPIKE_THRESHOLD = 0.10
+    MPC_HORIZON            = 24
+    REPLAN_COOLDOWN        = 4
+
+    # Bounded sliding window for in-memory history. The MPC needs at most the
+    # last horizon-worth of SOC/demand samples for its deviation detection;
+    # retaining every sample for a multi-month simulation has no algorithmic
+    # value and leaks memory in proportion to run length.
+    _HISTORY_WINDOW = 2_000  # ~21 simulated days at 15-min cadence
 
     def __init__(self):
         self.plan:     Optional[SchedulePlan] = None
         self.goals:    Optional[Goals]        = None
         self._steps_since_replan: int = 999  # allow replan on first trigger
         self._knowledge: dict = {
-            "soc_history":    [],
-            "demand_history": [],
-            "deviation_history": [],
+            "soc_history":    deque(maxlen=self._HISTORY_WINDOW),
+            "demand_history": deque(maxlen=self._HISTORY_WINDOW),
+            "deviation_history": deque(maxlen=self._HISTORY_WINDOW),
             "replan_count":   0,
         }
 
@@ -112,14 +122,23 @@ class ChangeManagementLayer:
 
     # ── Analyze ───────────────────────────────────────────────────────────────
 
-    def analyze(self, state: dict) -> DeviationEvent:
-        """Detect whether the current LP plan needs to be revised."""
+    def analyze(self, state: dict, sys_config: Optional[SystemConfig] = None) -> DeviationEvent:
+        """Detect whether the current LP plan needs to be revised.
+
+        Thresholds are read from sys_config when supplied (the ESDL path);
+        otherwise the class-level fallback constants are used (standalone harness).
+        """
         hour             = state["hour"]
         soc_actual       = state["soc_actual"]
         soc_planned      = state["soc_planned"]
         grid_actual      = state["grid_actual"]
         p_dc_actual_kw   = state.get("p_dc_actual_kw", 0.0)
         p_dc_forecast_kw = state.get("p_dc_forecast_kw", p_dc_actual_kw)
+
+        # ESDL-driven thresholds; fall back to class constants for the standalone harness.
+        soc_drift_thr   = getattr(sys_config, "mpc_soc_drift_threshold",   self.SOC_DRIFT_THRESHOLD)    if sys_config else self.SOC_DRIFT_THRESHOLD
+        demand_spike_thr= getattr(sys_config, "mpc_demand_spike_threshold", self.DEMAND_SPIKE_THRESHOLD) if sys_config else self.DEMAND_SPIKE_THRESHOLD
+        replan_cooldown = getattr(sys_config, "mpc_replan_cooldown",       self.REPLAN_COOLDOWN)        if sys_config else self.REPLAN_COOLDOWN
 
         # Was this step expected to have grid?
         grid_forecast    = bool(self.goals.grid_available.iloc[hour]) if self.goals else True
@@ -132,16 +151,16 @@ class ChangeManagementLayer:
         demand_delta = p_dc_actual_kw - p_dc_forecast_kw
         demand_spike = (
             p_dc_forecast_kw > 0.0
-            and (demand_delta / p_dc_forecast_kw) > self.DEMAND_SPIKE_THRESHOLD
+            and (demand_delta / p_dc_forecast_kw) > demand_spike_thr
         )
 
         # Only allow replan if cooldown has elapsed
         deviation_detected = (
-            soc_drift > self.SOC_DRIFT_THRESHOLD
+            soc_drift > soc_drift_thr
             or unplanned_outage
             or demand_spike
         )
-        triggered = deviation_detected and self._steps_since_replan >= self.REPLAN_COOLDOWN
+        triggered = deviation_detected and self._steps_since_replan >= replan_cooldown
         self._steps_since_replan += 1
 
         event = DeviationEvent(
@@ -158,7 +177,7 @@ class ChangeManagementLayer:
 
         if triggered:
             reason = []
-            if soc_drift > self.SOC_DRIFT_THRESHOLD:
+            if soc_drift > soc_drift_thr:
                 reason.append(f"SOC drift={soc_drift:.1f}%")
             if unplanned_outage:
                 reason.append("unplanned outage")
@@ -175,17 +194,19 @@ class ChangeManagementLayer:
 
     def replan_mpc(self, event: DeviationEvent, sys_config: SystemConfig) -> SchedulePlan:
         """
-        Rolling MPC: re-solve LP over the next MPC_HORIZON steps
+        Rolling MPC: re-solve LP over the next mpc_horizon_steps steps
         using the actual SOC and (if a demand spike occurred) the
         observed demand as the corrected forecast for the remaining horizon.
 
         Uses the same PuLP LP structure as Goal Management,
-        but over a shorter rolling window.
+        but over a shorter rolling window. Horizon is read from sys_config
+        (ESDL KPI mpc_horizon_steps), falling back to class constant if absent.
         """
         hour     = event.hour
         soc_init = event.soc_actual
         n_total  = len(self.goals.p_DC)
-        horizon  = min(self.MPC_HORIZON, n_total - hour)
+        mpc_horizon_steps = getattr(sys_config, "mpc_horizon_steps", self.MPC_HORIZON)
+        horizon  = min(mpc_horizon_steps, n_total - hour)
 
         if horizon <= 0:
             return self.plan
@@ -266,9 +287,29 @@ class ChangeManagementLayer:
 
             # Grid limits and balance
             prob += p_grid[t] >= p_dc_t - p_pv_t + p_ch[t] - p_dch[t] - unserved[t]
-            
+
             if not bool(avail.iloc[t]):
                 prob += p_grid[t] == 0
+            else:
+                # Firm-grid assumption: when grid is forecast-available, demand
+                # MUST be served. unserved=0 by construction; w_unserved is
+                # irrelevant. See same logic in Goal Management Algorithm 1.
+                prob += unserved[t] == 0
+
+        # Terminal-SOC anchor: keep the MPC aligned with the day-ahead plan
+        # at the end of the rolling window. Without this the rolling MPC can
+        # walk away from the DA intent over many replans and drift to empty.
+        # The ±10pp band lets the MPC deviate locally if a real disturbance
+        # demands it, but the central tendency stays on the planned trajectory.
+        if sys_config.E_BAT > 0.0:
+            end_idx = hour + horizon - 1
+            if end_idx < len(self.plan.SOC_plan):
+                soc_anchor = float(self.plan.SOC_plan.iloc[end_idx])
+            else:
+                soc_anchor = sys_config.soc_baseline
+            soc_anchor = max(sys_config.soc_baseline, soc_anchor)
+            prob += soc_var[n - 1] >= soc_anchor - 10.0
+            prob += soc_var[n - 1] <= soc_anchor + 10.0
 
         # Use a safe CMD solver for background execution to prevent temporary file clashes and blocking.
         solver = pulp.PULP_CBC_CMD(

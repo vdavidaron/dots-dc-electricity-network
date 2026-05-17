@@ -17,31 +17,62 @@ area = es.instance[0].area
 # -----------------------------------------------------------------------------
 # 2. Define assets
 # -----------------------------------------------------------------------------
-# REQUIRED: The Balancer uses this to identify the network it is balancing
-lv_network = esdl.ElectricityNetwork(id=str(uuid.uuid4()), name="Site LV Network")
+# REQUIRED: The Balancer uses this to identify the network it is balancing.
+# All controller-tuning KPIs live on this asset (matching the production
+# datacenter_bess_scenario.py at dots-services/dots-simulation/).
+lv_network = esdl.ElectricityNetwork(id=str(uuid.uuid4()), name="Site Electricity Management System")
+lv_network.KPIs = esdl.KPIs(id=str(uuid.uuid4()))
+# Lexicographic LP weights
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="w_unserved", value=1e9))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="w_carbon", value=1.0))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="w_price", value=1.0))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="w_effort", value=0.01))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="w_soc_low", value=1e6))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="soc_baseline", value=50.0))
+# Asset-level enablement toggles
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="enable_battery", value=1.0))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="enable_backup_generator", value=1.0))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="enable_renewable_service", value=1.0))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="enable_change_management", value=1.0))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="enable_goal_management", value=1.0))
+# Mandate toggle — when False, the grid is treated as a one-way import sink
+# (no surplus-absorption obligation, no PV curtailment forced by grid surplus).
+# Default off in this test fixture so tests don't exercise the mandate path.
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="enable_mandate", value=0.0))
+# MPC deviation thresholds
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="mpc_soc_drift_threshold", value=5.0))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="mpc_demand_spike_threshold", value=0.10))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="mpc_horizon_steps", value=24.0))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="mpc_replan_cooldown", value=4.0))
+# Forecast-error model parameters
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="forecast_sigma_ci", value=0.12))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="forecast_sigma_p_dc", value=0.05))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="forecast_sigma_price", value=0.15))
+lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="forecast_seed", value=42.0))
 
 # SERVICE 1: DatacenterDemandService - Realistic 4MW load
 # power is typically EDouble but minLoad is EInt in some ESDL versions
 datacenter = esdl.ElectricityDemand(id=str(uuid.uuid4()), name="Datacenter Load", power=4000000.0)
-datacenter.powerFactor = 0.95            
+datacenter.powerFactor = 0.95
 
 # SERVICE 2: BatteryService - Realistic 10MWh / 4MW BESS
-bess = esdl.Battery(id=str(uuid.uuid4()), name="Datacenter BESS", capacity=4000000.0) 
+bess = esdl.Battery(id=str(uuid.uuid4()), name="Datacenter BESS", capacity=4000000.0)
 bess.chargeEfficiency = 0.95
 bess.dischargeEfficiency = 0.95
 bess.maxChargeRate = 4000000.0
 bess.maxDischargeRate = 4000000.0
 
-# SERVICE 3: PowerPlantService - Realistic 5MW Grid connection
+# SERVICE 3: PowerPlantService - Realistic Grid connection.
+# minLoad=0 here because the test fixture has enable_mandate=0; making the
+# constraint match the toggle keeps the test consistent with what the
+# powerplant calc will compute at runtime. To exercise the mandate path
+# explicitly in a test, set enable_mandate=1 and minLoad=-75000000.
 grid_connection = esdl.PowerPlant(id=str(uuid.uuid4()), name="Grid Connection", power=75000000.0)
-grid_connection.efficiency = 1.0         
-grid_connection.minLoad = -75000000      # Use int for minLoad
+grid_connection.efficiency = 1.0
+grid_connection.minLoad = 0              # Use int for minLoad
 
 # SERVICE 4: LocalGenerator - Realistic 5MW Backup
 backup_generator = esdl.GasProducer(id=str(uuid.uuid4()), name="Backup Generator", power=5000000.0)
-startup_kpi = esdl.DoubleKPI(id=str(uuid.uuid4()), name="startup_delay_s", value=60.0)
-backup_generator.KPIs = esdl.KPIs(id=str(uuid.uuid4()))
-backup_generator.KPIs.kpi.append(startup_kpi)
 
 # SERVICE 5: LocalRenewable - Realistic 1MW Solar array
 local_renewable = esdl.PVInstallation(id=str(uuid.uuid4()), name="Local RES", power=1000000.0)

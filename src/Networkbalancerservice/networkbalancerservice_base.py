@@ -47,7 +47,7 @@ class NetworkbalancerserviceBase(HelicsSimulationExecutor):
         
         ]
         day_ahead_routing_information = HelicsCalculationInformation(
-            time_period_in_seconds=86400,
+            time_period_in_seconds=43200,
             offset=2, 
             uninterruptible=False, 
             wait_for_current_time_update=False, 
@@ -94,14 +94,16 @@ class NetworkbalancerserviceBase(HelicsSimulationExecutor):
                                     input_name="potential_available_generation_ID", 
                                     input_unit="W", 
                                     input_type=h.HelicsDataType.DOUBLE),
-            SubscriptionDescription(esdl_type="GasProducer", 
-                                    input_name="backup_supplied_power", 
-                                    input_unit="W", 
-                                    input_type=h.HelicsDataType.DOUBLE),
-            SubscriptionDescription(esdl_type="GasProducer", 
-                                    input_name="available_max_power", 
-                                    input_unit="W", 
-                                    input_type=h.HelicsDataType.DOUBLE),
+            # GasProducer (backup-gen) subscriptions intentionally removed.
+            # The network-balancer dispatch federate uses `time_request_type=ON_INPUT`
+            # and waits for ALL subscribed inputs before each calc step. If the
+            # backup-gen federate ever stops publishing (silent crash, OOM, slow
+            # InfluxDB write, etc.), the entire federation deadlocks because the
+            # broker cannot advance time. Removing these two subscriptions breaks
+            # that hard-coupling: the controller treats backup state as a cached
+            # default (0.0 W) rather than a live signal. This is a correctness
+            # trade-off (the LP no longer sees real-time backup state) for a
+            # robustness gain (a backup-gen failure no longer halts the run).
         ]
         network_dispatch_outputs = [
         
