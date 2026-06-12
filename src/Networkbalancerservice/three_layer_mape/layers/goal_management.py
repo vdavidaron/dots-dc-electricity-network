@@ -40,6 +40,10 @@ class SystemConfig:
     w_soc_low: float = 1e6
     soc_baseline: float = 50.0  # Soft SOC target [%]
 
+    # Backup generator (Scope-1) accounting — read from ESDL KPIs.
+    backup_co2_factor: float = 600.0        # [gCO2/kWh] diesel combustion emission factor
+    backup_cost_eur_per_kwh: float = 0.40   # [EUR/kWh] diesel fuel cost
+
     # Change Management (MPC) deviation thresholds — read from ESDL KPIs
     mpc_soc_drift_threshold: float = 5.0       # [%] replan if |SOC_actual - SOC_planned| exceeds this
     mpc_demand_spike_threshold: float = 0.10   # [fraction] replan if actual_demand > forecast by this fraction
@@ -189,19 +193,33 @@ class GoalManagementLayer:
         # that 1pp would have displaced in the next 4 hours.
         mean_ci = float(goals.CI_grid.mean()) if len(goals.CI_grid) else 0.0
         mean_pr = float(price.mean()) if len(price) else 0.0
-        # 1pp of SOC = E_BAT/100 kWh; discharged at eta_dch yields E_BAT*eta/100 kWh delivered.
-        shadow_carbon = w_carbon * mean_ci    * (sys_config.E_BAT / 100.0) * sys_config.EFF_DCH
-        shadow_price  = w_price  * mean_pr    * (sys_config.E_BAT / 100.0) * sys_config.EFF_DCH
+        # Normalise each externality term by its horizon mean so that w_carbon
+        # and w_price are comparable *influence* weights, not raw-unit
+        # multipliers. CI (~250 gCO2/kWh) and price (~75 EUR/MWh) sit on
+        # different numeric scales, so the previous form (raw CI / price times
+        # the same weight) made w_carbon = w_price behave as roughly 3:1
+        # carbon-favouring and compressed the RQ1 weight sweep. After
+        # normalisation both terms are O(1) per kWh and the ratio
+        # w_carbon : w_price maps directly to objective influence. This rescales
+        # the LP objective only; the realised carbon/cost metrics computed in
+        # component_control.py are in physical units and are unaffected.
+        ci_scale = mean_ci if mean_ci > 1e-9 else 1.0
+        pr_scale = mean_pr if mean_pr > 1e-9 else 1.0
+        # Future-value-of-SOC reward, in the same normalised units: one unit of
+        # terminal SOC energy displaces, on average, one normalised unit of
+        # carbon and of price (the horizon mean), hence the unit coefficient.
+        shadow_carbon = w_carbon * (sys_config.E_BAT / 100.0) * sys_config.EFF_DCH
+        shadow_price  = w_price  * (sys_config.E_BAT / 100.0) * sys_config.EFF_DCH
 
         prob += (
             w_unserved * pulp.lpSum(unserved[t] for t in range(n))
             + w_soc_low  * pulp.lpSum(soc_slack[t] for t in range(n))
             + w_carbon   * pulp.lpSum(
-                goals.CI_grid.iloc[t] * p_grid[t] * dt
+                (goals.CI_grid.iloc[t] / ci_scale) * p_grid[t] * dt
                 for t in range(n)
             )
             + w_price * pulp.lpSum(
-                price.iloc[t] * p_grid[t] * dt
+                (price.iloc[t] / pr_scale) * p_grid[t] * dt
                 for t in range(n)
             )
             + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))

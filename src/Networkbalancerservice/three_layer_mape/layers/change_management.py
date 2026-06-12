@@ -251,15 +251,24 @@ class ChangeManagementLayer:
         w_effort   = sys_config.w_effort
         w_soc_low  = sys_config.w_soc_low
 
+        # Normalise carbon and price by their window means, mirroring the
+        # day-ahead LP (goal_management.py), so the two layers optimise against
+        # the same influence-weighted objective and w_carbon : w_price means the
+        # same thing in both. Window means keep both terms O(1) per kWh.
+        mean_ci_w = float(ci.mean()) if len(ci) else 0.0
+        mean_pr_w = float(price.mean()) if len(price) else 0.0
+        ci_scale = mean_ci_w if mean_ci_w > 1e-9 else 1.0
+        pr_scale = mean_pr_w if mean_pr_w > 1e-9 else 1.0
+
         prob += (
             w_unserved * pulp.lpSum(unserved[t] for t in range(n))
             + w_soc_low * pulp.lpSum(soc_slack[t] for t in range(n))
             + w_carbon * pulp.lpSum(
-                ci.iloc[t] * p_grid[t] * dt
+                (ci.iloc[t] / ci_scale) * p_grid[t] * dt
                 for t in range(n)
             )
             + w_price * pulp.lpSum(
-                price.iloc[t] * p_grid[t] * dt
+                (price.iloc[t] / pr_scale) * p_grid[t] * dt
                 for t in range(n)
             )
             + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))

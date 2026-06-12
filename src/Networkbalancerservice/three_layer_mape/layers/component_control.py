@@ -176,12 +176,21 @@ class ComponentControlLayer:
             CI_battery_new    = CI_battery_prev
             Price_battery_new = Price_battery_prev
 
-        # Effective CI / price of DC consumption (grid + battery, plus backup if any)
+        # Effective CI / price of DC consumption (grid + battery only).
         total_dc_carbon = (CI_grid    * p_grid_to_DC + CI_battery_prev    * p_bess_to_DC) * dt
         total_dc_price  = (Price_grid * p_grid_to_DC + Price_battery_prev * p_bess_to_DC) * dt
-        if getattr(sys_config, 'enable_backup_generator', True) and unserved > 0:
-            # Backup CO2 assumption (600 gCO2/kWh); no fuel cost attributed here.
-            total_dc_carbon += (600.0 * unserved) * dt
+        # NOTE: Unserved load is deliberately NOT charged backup-generator carbon
+        # here. Backup dispatch is owned by the BackupGen federate and only
+        # happens when the controller actually commits it (which, on the traces
+        # studied, it does not). The previous behaviour added 600 gCO2/kWh to
+        # every kWh of *unserved* load whenever the backup asset was merely
+        # enabled, while that same energy was still counted as unserved upstream.
+        # That double-counted the energy (unserved AND served-by-backup) and
+        # inflated cumulative carbon for any backup-enabled run, producing a
+        # spurious gap between the 0 MW and non-zero backup-capacity points and
+        # the artefactual "+12.45% carbon at zero storage" headline. Genuine
+        # Scope-1 backup emissions are accounted by the BackupGen federate when
+        # (and only when) it actually supplies power.
 
         if p_DC > 0.01:
             CI_DC_consumption    = total_dc_carbon / (p_DC * dt)

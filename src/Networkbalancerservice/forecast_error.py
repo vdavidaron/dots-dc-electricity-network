@@ -47,11 +47,10 @@
 
 from __future__ import annotations
 
-import logging
 import numpy as np
 import pandas as pd
 
-LOGGER = logging.getLogger(__name__)
+from dots_infrastructure.Logger import LOGGER
 
 
 # ── Fallback relative standard deviations (literature-calibrated) ────────────
