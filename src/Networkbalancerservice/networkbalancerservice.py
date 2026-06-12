@@ -36,8 +36,6 @@ import numpy as np
 
 from forecast_error import ForecastErrorModel
 
-LOGGER = logging.getLogger(__name__)
-
 
 class Networkbalancerservice(NetworkbalancerserviceBase):
     """
@@ -179,14 +177,33 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.current_price_battery = 0.0    # [EUR/MWh] Initial assumption
 
         # Cumulative running totals (reset on service init only — not per day)
-        self._cum_carbon_g       = 0.0   # gCO2
-        self._cum_cost_eur       = 0.0   # EUR
-        self._cum_unserved_kwh   = 0.0   # kWh
+        self._cum_carbon_g       = 0.0   # gCO2 — total (Scope 2 + Scope 1)
+        self._cum_cost_eur       = 0.0   # EUR  — grid bill + backup diesel fuel
+        self._cum_unserved_kwh   = 0.0   # kWh  — residual after backup serves what it can
         self._cum_grid_energy_kwh = 0.0  # kWh — denominator for effective CI/price
+        self._cum_scope2_carbon_g   = 0.0  # gCO2 — Scope 2 (grid imports + battery-stored grid energy)
+        self._cum_scope1_carbon_g   = 0.0  # gCO2 — Scope 1 (on-site backup combustion)
+        self._cum_backup_energy_kwh = 0.0  # kWh  — energy served by the backup generator
+        self._cum_backup_fuel_eur   = 0.0  # EUR  — diesel fuel cost of backup dispatch
 
-        # Counterfactual "no-optimisation" baseline: spot-price × instantaneous DC load
-        self._cum_baseline_cost_eur = 0.0  # EUR — what DC would have paid at spot
-        self._cum_baseline_carbon_g = 0.0  # gCO2 — same baseline for carbon
+        # Two counterfactual baselines, each with the full carbon/cost/unserved
+        # triple (see the dispatch step for the definitions):
+        #   EqualService — serves the same load as the EMS, naive timing, no battery
+        #   Passive      — same PV and grid limit, no battery, sheds the overflow
+        self._cum_es_carbon_g        = 0.0  # gCO2 — equal-service baseline emissions
+        self._cum_es_cost_eur        = 0.0  # EUR  — equal-service baseline bill
+        self._cum_es_unserved_kwh    = 0.0  # kWh  — equal-service unserved (= EMS unserved)
+        self._cum_passive_carbon_g   = 0.0  # gCO2 — passive (no-battery) emissions
+        self._cum_passive_cost_eur   = 0.0  # EUR  — passive (no-battery) bill
+        self._cum_passive_unserved_kwh = 0.0  # kWh  — passive (no-battery) shed load
+
+        # Extended metrics
+        self._cum_pv_energy_kwh         = 0.0  # kWh — gross PV yield (for CFE score)
+        self._cum_dc_energy_kwh         = 0.0  # kWh — total IT load energy (CFE denominator)
+        self._cum_bess_throughput_kwh   = 0.0  # kWh — |charge| + |discharge| (degradation proxy)
+        self._cum_bess_discharge_kwh    = 0.0  # kWh — discharge only (LCOS denominator)
+        self._cum_congestion_served_kwh = 0.0  # kWh — BESS+backup during grid curtailment
+        self._cum_curtailment_steps     = 0    # steps where grid could not supply full load
 
         # InfluxDB write pacing — see notes at end of _do_network_dispatch
         self._influx_flush_every_n_steps = 96   # once per simulated day (96 × 15min)
@@ -522,17 +539,33 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         if not getattr(self.sys_config, 'enable_battery', True):
             bess_w = 0.0
         
-        # Calculate served/unserved power and backup dispatch
+        # ── Backup generator dispatch + Scope-1 accounting ──────────────────
+        # The backup generator serves whatever grid + PV + battery could not,
+        # up to its nameplate capacity (reported by the BackupGen federate as
+        # available_max_power). Energy it serves is removed from the unserved
+        # total and charged Scope-1 carbon (on-site diesel combustion) plus a
+        # diesel fuel cost. Without backup the shortfall stays unserved and
+        # carries neither carbon nor cost. This is the channel through which a
+        # harsh-curtailment scenario realises the Scope-2 → Scope-1 shift.
         if getattr(self.sys_config, 'enable_backup_generator', True):
-            # Backup generator covers any shortfall → no outage
-            backup_w = unserved_kw * 1000.0  # Request backup to cover unserved
-            served_power_w = demand_w
-            unserved_outage_w = 0.0
+            # Backup nameplate comes from the ESDL (GasProducer.power). The NB does
+            # not subscribe to the BackupGen federate's capacity publication (that
+            # subscription was removed for federation robustness), so reading it
+            # from the ESDL is what lets the controller actually account backup
+            # dispatch instead of leaving backup_max_w at 0 (never dispatching).
+            backup_capacity_kw = (backup_max_w if backup_max_w > 0 else getattr(self, 'backup_capacity_w', 5_000_000.0)) / 1000.0
+            backup_served_kw   = min(unserved_kw, backup_capacity_kw)
+            backup_w           = unserved_kw * 1000.0           # full request to the federate
         else:
-            # No backup → unserved power IS the outage
-            backup_w = 0.0
-            unserved_outage_w = unserved_kw * 1000.0
-            served_power_w = max(0.0, demand_w - unserved_outage_w)
+            backup_served_kw   = 0.0
+            backup_w           = 0.0
+        true_unserved_kw  = max(0.0, unserved_kw - backup_served_kw)
+        unserved_outage_w = true_unserved_kw * 1000.0
+        served_power_w    = max(0.0, demand_w - unserved_outage_w)
+
+        backup_energy_kwh    = backup_served_kw * self.sys_config.dt
+        step_scope1_carbon_g = getattr(self.sys_config, 'backup_co2_factor', 600.0) * backup_energy_kwh
+        step_backup_fuel_eur = getattr(self.sys_config, 'backup_cost_eur_per_kwh', 0.40) * backup_energy_kwh
 
         # ── 4. COMPREHENSIVE LOGGING ──
         
@@ -560,27 +593,104 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.influx_connector.set_time_step_data_point(esdl_id, "Price_DC_Consumption_EUR_MWh", simulation_time, exec_state.Price_DC_consumption)
         self.influx_connector.set_time_step_data_point(esdl_id, "Price_Battery_EUR_MWh", simulation_time, exec_state.Price_battery)
 
-        # Cumulative running totals (each measurement = sum from t=0 up to this step)
-        step_unserved_kwh = exec_state.unserved * self.sys_config.dt
-        self._cum_carbon_g        += exec_state.carbon
-        self._cum_cost_eur        += exec_state.cost
-        self._cum_unserved_kwh    += step_unserved_kwh
-        self._cum_grid_energy_kwh += exec_state.p_grid * self.sys_config.dt
+        # Cumulative running totals (each measurement = sum from t=0 up to this step).
+        # Carbon splits into Scope 2 (grid imports + battery-stored grid energy, from
+        # component_control) and Scope 1 (on-site backup combustion). The headline
+        # Cumulative_Carbon_g is the total of both, so the scope shift is visible in a
+        # single trace. Cost combines the wholesale grid bill with backup diesel fuel.
+        # Unserved is the residual after the backup generator has served what it can.
+        step_unserved_kwh = true_unserved_kw * self.sys_config.dt
+        self._cum_scope2_carbon_g   += exec_state.carbon
+        self._cum_scope1_carbon_g   += step_scope1_carbon_g
+        self._cum_carbon_g          += exec_state.carbon + step_scope1_carbon_g
+        self._cum_cost_eur          += exec_state.cost + step_backup_fuel_eur
+        self._cum_backup_energy_kwh += backup_energy_kwh
+        self._cum_backup_fuel_eur   += step_backup_fuel_eur
+        self._cum_unserved_kwh      += step_unserved_kwh
+        self._cum_grid_energy_kwh   += exec_state.p_grid * self.sys_config.dt
 
+        self.influx_connector.set_time_step_data_point(esdl_id, "Step_Scope1_Carbon_g", simulation_time, step_scope1_carbon_g)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Served_Power_W", simulation_time, backup_served_kw * 1000.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Backup_Fuel_Cost_EUR", simulation_time, step_backup_fuel_eur)
         self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Carbon_g", simulation_time, self._cum_carbon_g)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Scope2_Carbon_g", simulation_time, self._cum_scope2_carbon_g)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Scope1_Carbon_g", simulation_time, self._cum_scope1_carbon_g)
         self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Cost_EUR", simulation_time, self._cum_cost_eur)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Backup_Energy_kWh", simulation_time, self._cum_backup_energy_kwh)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Backup_Fuel_Cost_EUR", simulation_time, self._cum_backup_fuel_eur)
         self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Unserved_kWh", simulation_time, self._cum_unserved_kwh)
         self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Grid_Energy_kWh", simulation_time, self._cum_grid_energy_kwh)
 
-        # Counterfactual baseline: spot price × DC load (no BESS / no PV optimisation)
-        step_baseline_cost_eur = price_now * (p_dc_kw * self.sys_config.dt) / 1000.0
-        step_baseline_carbon_g = ci_val * (p_dc_kw * self.sys_config.dt)
-        self._cum_baseline_cost_eur += step_baseline_cost_eur
-        self._cum_baseline_carbon_g += step_baseline_carbon_g
-        self.influx_connector.set_time_step_data_point(esdl_id, "Baseline_Step_Cost_EUR", simulation_time, step_baseline_cost_eur)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Baseline_Step_Carbon_g", simulation_time, step_baseline_carbon_g)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Baseline_Cost_EUR", simulation_time, self._cum_baseline_cost_eur)
-        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Baseline_Carbon_g", simulation_time, self._cum_baseline_carbon_g)
+        # Two counterfactual baselines are logged, each with the full carbon /
+        # cost / unserved triple so neither is ambiguous:
+        #
+        # 1. EQUAL-SERVICE (naive-timing): serves exactly the load the EMS served
+        #    (demand minus the EMS's residual unserved), met from PV then grid at
+        #    the spot CI/price of the moment, with NO battery. Isolates the
+        #    carbon/cost benefit of dispatch *timing* at equal service; its
+        #    unserved therefore equals the EMS's by construction.
+        # 2. PASSIVE (no battery): same PV and same grid limit, but no battery, so
+        #    it sheds whatever net load exceeds the limit. This is the
+        #    "do nothing" deployment reference; the gap to the EMS on unserved is
+        #    the load the battery rescues, and its higher carbon/cost is what the
+        #    EMS avoids by serving the same shed-free load more cleanly.
+        ems_served_kw = max(0.0, p_dc_kw - true_unserved_kw)
+        es_grid_kw    = max(0.0, ems_served_kw - pv_kw)
+        es_carbon_g   = ci_val   * (es_grid_kw * self.sys_config.dt)
+        es_cost_eur   = price_now * (es_grid_kw * self.sys_config.dt) / 1000.0
+        es_unserved_kwh = true_unserved_kw * self.sys_config.dt
+
+        passive_net_kw      = max(0.0, p_dc_kw - pv_kw)
+        passive_grid_lim_kw = min(self.sys_config.P_GRID_MAX, limit_w / 1000.0) if grid_available else 0.0
+        passive_grid_kw     = min(passive_net_kw, passive_grid_lim_kw)
+        passive_unserved_kw = max(0.0, passive_net_kw - passive_grid_lim_kw)
+        passive_carbon_g    = ci_val   * (passive_grid_kw * self.sys_config.dt)
+        passive_cost_eur    = price_now * (passive_grid_kw * self.sys_config.dt) / 1000.0
+        passive_unserved_kwh = passive_unserved_kw * self.sys_config.dt
+
+        self._cum_es_carbon_g        += es_carbon_g
+        self._cum_es_cost_eur        += es_cost_eur
+        self._cum_es_unserved_kwh    += es_unserved_kwh
+        self._cum_passive_carbon_g   += passive_carbon_g
+        self._cum_passive_cost_eur   += passive_cost_eur
+        self._cum_passive_unserved_kwh += passive_unserved_kwh
+
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_EqualService_Carbon_g", simulation_time, self._cum_es_carbon_g)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_EqualService_Cost_EUR", simulation_time, self._cum_es_cost_eur)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_EqualService_Unserved_kWh", simulation_time, self._cum_es_unserved_kwh)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Passive_Carbon_g", simulation_time, self._cum_passive_carbon_g)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Passive_Cost_EUR", simulation_time, self._cum_passive_cost_eur)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Passive_Unserved_kWh", simulation_time, self._cum_passive_unserved_kwh)
+
+        # ── Extended cumulative metrics ──────────────────────────────────────
+        # Curtailment: grid cannot supply full load (limit below demand, or fully down)
+        curtailment_on = not grid_available or (limit_w < demand_w * 0.99)
+        bess_kw_signed = bess_w / 1000.0                               # + discharge, − charge
+        step_pv_kwh    = pv_kw * self.sys_config.dt
+        step_dc_kwh    = (demand_w / 1000.0) * self.sys_config.dt
+        step_throughput   = abs(bess_kw_signed) * self.sys_config.dt
+        step_discharge_kwh = max(0.0, bess_kw_signed) * self.sys_config.dt
+        step_congestion_kwh = (
+            step_discharge_kwh + backup_supplied_w / 1000.0 * self.sys_config.dt
+        ) if curtailment_on else 0.0
+
+        self._cum_pv_energy_kwh         += step_pv_kwh
+        self._cum_dc_energy_kwh         += step_dc_kwh
+        self._cum_bess_throughput_kwh   += step_throughput
+        self._cum_bess_discharge_kwh    += step_discharge_kwh
+        self._cum_congestion_served_kwh += step_congestion_kwh
+        if curtailment_on:
+            self._cum_curtailment_steps += 1
+
+        grid_compliance_flag = 1.0 if (grid_w <= limit_w + 1000.0) else 0.0  # 1 kW tolerance
+
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_PV_Energy_kWh",         simulation_time, self._cum_pv_energy_kwh)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_DC_Energy_kWh",         simulation_time, self._cum_dc_energy_kwh)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_BESS_Throughput_kWh",   simulation_time, self._cum_bess_throughput_kwh)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_BESS_Discharge_kWh",    simulation_time, self._cum_bess_discharge_kwh)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Cumulative_Congestion_Served_kWh", simulation_time, self._cum_congestion_served_kwh)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Curtailment_Active_Flag",          simulation_time, 1.0 if curtailment_on else 0.0)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Grid_Compliance_Flag",             simulation_time, grid_compliance_flag)
 
         # Plan Comparisons (Current Step)
         self.influx_connector.set_time_step_data_point(esdl_id, "Planned_SOC", simulation_time, planned_soc)
@@ -680,6 +790,9 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             elif eClass.name == "PowerPlant":
                 self.grid_import_limit_w = float(getattr(obj, "power", 4000000.0))
 
+            elif eClass.name == "GasProducer":
+                self.backup_capacity_w = float(getattr(obj, "power", 5_000_000.0))
+
             elif eClass.name == "ElectricityNetwork":
                 if hasattr(obj, "KPIs") and obj.KPIs is not None:
                     for kpi in obj.KPIs.kpi:
@@ -696,6 +809,10 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                                 self.sys_config.w_soc_low = float(kpi.value)
                             elif kpi.name == "soc_baseline":
                                 self.sys_config.soc_baseline = float(kpi.value)
+                            elif kpi.name == "backup_co2_factor":
+                                self.sys_config.backup_co2_factor = float(kpi.value)
+                            elif kpi.name == "backup_cost_eur_per_kwh":
+                                self.sys_config.backup_cost_eur_per_kwh = float(kpi.value)
 
                             elif kpi.name == "mpc_soc_drift_threshold":
                                 self.sys_config.mpc_soc_drift_threshold = float(kpi.value)
