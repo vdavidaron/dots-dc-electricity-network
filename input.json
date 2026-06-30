@@ -32,6 +32,13 @@
                     "unit": "VECTOR"
                 },
                 {
+                    "name": "carbon_free_plan_DA",
+                    "esdl_type": "PowerPlant",
+                    "data_type": "VECTOR",
+                    "description": "Grid carbon-free share forecast [%]",
+                    "unit": "VECTOR"
+                },
+                {
                     "name": "electricity_price_plan_DA",
                     "esdl_type": "PowerPlant",
                     "data_type": "VECTOR",
@@ -95,6 +102,13 @@
                     "data_type": "DOUBLE",
                     "description": "Grid carbon",
                     "unit": "gCO2/kWh"
+                },
+                {
+                    "name": "actual_carbon_free_pct_ID",
+                    "esdl_type": "PowerPlant",
+                    "data_type": "DOUBLE",
+                    "description": "Real-time grid carbon-free share",
+                    "unit": "%"
                 },
                 {
                     "name": "mandated_min_power_draw_ID",

@@ -559,6 +559,23 @@ class TestNetworkBalancerIntegration(unittest.TestCase):
         self.assertFalse(math.isnan(output.grid_allocation_w))
         self.assertFalse(math.isnan(output.bess_allocation_w))
 
+    def test_init_reads_fill_level(self):
+        """Verify that init_calculation_service reads the initial SOC from the ESDL Storage object."""
+        from esdl import Storage
+        from dots_infrastructure.EsdlHelperFunctions import EsdlHelperFunctions
+        
+        # Modify the existing Battery in the loaded ESDL
+        storages = EsdlHelperFunctions.get_all_esdl_objects_from_type(self.energy_system.eAllContents(), Storage)
+        if storages:
+            storages[0].fillLevel = 0.3
+            
+        service = Networkbalancerservice()
+        service.influx_connector = MagicMock()
+        service.init_calculation_service(self.energy_system)
+        
+        # Should be parsed as 30.0% (0.3 * 100)
+        self.assertEqual(service.current_soc, 30.0)
+
 
 if __name__ == '__main__':
     unittest.main()

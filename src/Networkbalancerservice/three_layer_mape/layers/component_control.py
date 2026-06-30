@@ -54,7 +54,8 @@ class ComponentControlLayer:
         Price_grid: float = 0.0,    # Day-ahead price [EUR/MWh]
         Price_battery_prev: float = 0.0, # Price intensity of energy in battery [EUR/MWh]
         p_PV:       float = 0.0,    # Actual PV generation [kW]
-        p_grid_limit_kw: float = 1e9 # Actual dynamic grid limit [kW]
+        p_grid_limit_kw: float = 1e9, # Actual dynamic grid limit [kW]
+        grid_cfe_frac: float = None  # Actual grid carbon-free share [fraction 0..1]
     ) -> ComponentState:
 
         dt        = sys_config.dt
@@ -65,16 +66,33 @@ class ComponentControlLayer:
         # Use the provided dynamic limit if it's smaller than the nameplate capacity
         actual_limit_kw = min(sys_config.P_GRID_MAX, p_grid_limit_kw) if grid_avail else 0.0
 
+        # ── Hard carbon-free-operation gate (block mode) ─────────────────────
+        # In block mode (cfe_constraint_mode == 2) the grid may be drawn from only
+        # when its real-time carbon-free share meets the floor. A dirtier step is
+        # handled exactly like a grid outage: PV + battery serve the load (limited
+        # by the battery's actual state of charge) and any remainder becomes
+        # unserved energy. Routing it through the islanding path — rather than
+        # merely zeroing the grid limit — is what makes the floor honest: an
+        # undersized battery shows real unserved energy instead of a phantom
+        # over-discharge below SOC_MIN.
+        cfe_mode = float(getattr(sys_config, 'cfe_constraint_mode', 0.0))
+        cfe_thr  = float(getattr(sys_config, 'cfe_min_fraction', 0.0))
+        grid_blocked = (cfe_mode == 2 and cfe_thr > 0.0
+                        and grid_cfe_frac is not None and grid_cfe_frac < cfe_thr)
+        grid_usable = grid_avail and not grid_blocked
+
         # ── Battery Enablement Check ─────────────────────────────────────────
         battery_enabled = getattr(sys_config, 'enable_battery', True)
         if not battery_enabled:
             p_ref = 0.0
         else:
-            # ── Override: if grid unexpectedly down, discharge to cover net DC load ──
-            if not grid_avail:
+            # ── Override: if grid unusable (outage or CFE-blocked), discharge to cover net DC load ──
+            if not grid_usable:
                 p_ref     = np.clip(p_DC - p_PV, -sys_config.P_CH_MAX, sys_config.P_DCH_MAX)
                 alarm     = True
-                alarm_msg = "Unplanned grid outage — emergency islanding"
+                alarm_msg = ("Carbon-free block — islanding on PV+battery"
+                             if grid_blocked else
+                             "Unplanned grid outage — emergency islanding")
 
             # ── Hard power clamp ─────────────────────────────────────────────────
             p_ref = np.clip(p_ref, -sys_config.P_CH_MAX, sys_config.P_DCH_MAX)
@@ -114,9 +132,9 @@ class ComponentControlLayer:
         # ── Energy balance ───────────────────────────────────────────────────
         # Grid draw = DC load - PV generation + Battery charging (-p_ref if p_ref < 0) - Battery discharging (p_ref if p_ref > 0)
         # So p_grid = p_DC - p_PV - p_ref
-        if grid_avail:
+        if grid_usable:
             p_grid_calc = p_DC - p_PV - p_ref
-            
+
             # If grid limit hit, we must first reduce charging (if any), then discharge more (if possible), then shed load.
             if p_grid_calc > actual_limit_kw:
                 # We need p_grid = p_DC - p_PV - p_ref_new <= actual_limit_kw

@@ -52,7 +52,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             self.simulator_configuration.influx_password, 
             self.simulator_configuration.influx_database_name
         )
-        self.current_soc = 50.0
+        self.current_soc = 0.0
 
         # ── Forecast error model ───────────────────────────────
         # Constructed for real in init_calculation_service() once the ESDL
@@ -70,6 +70,15 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                 self.esdl_obj_mapping[esdl_obj.id] = esdl_obj
         
         LOGGER.info("Initializing Network Balancer Service...")
+
+        # Parse initial SOC from ESDL Storage objects (if available)
+        from esdl import Storage
+        all_storages = EsdlHelperFunctions.get_all_esdl_objects_from_type(energy_system.eAllContents(), Storage)
+        for storage in all_storages:
+            if hasattr(storage, 'fillLevel') and storage.fillLevel is not None:
+                self.current_soc = float(storage.fillLevel) * 100.0
+                LOGGER.info(f"Parsed initial SOC from ESDL: {self.current_soc}%")
+                break
 
         # Default fallback values
         self.grid_import_limit_w = 4_000_000.0
@@ -90,6 +99,8 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         _w_effort = getattr(self.sys_config, 'w_effort', 0.01)
         _w_soc_low = getattr(self.sys_config, 'w_soc_low', 1e6)
         _soc_baseline = getattr(self.sys_config, 'soc_baseline', 50.0)
+        _cfe_constraint_mode = getattr(self.sys_config, 'cfe_constraint_mode', 0.0)
+        _cfe_min_fraction = getattr(self.sys_config, 'cfe_min_fraction', 0.0)
         _enable_mandate = getattr(self.sys_config, 'enable_mandate', True)
         _mpc_soc_drift   = getattr(self.sys_config, 'mpc_soc_drift_threshold', 5.0)
         _mpc_demand_spike = getattr(self.sys_config, 'mpc_demand_spike_threshold', 0.10)
@@ -122,6 +133,8 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.sys_config.w_effort = _w_effort
         self.sys_config.w_soc_low = _w_soc_low
         self.sys_config.soc_baseline = _soc_baseline
+        self.sys_config.cfe_constraint_mode = _cfe_constraint_mode
+        self.sys_config.cfe_min_fraction = _cfe_min_fraction
         self.sys_config.enable_mandate = _enable_mandate
         self.sys_config.mpc_soc_drift_threshold = _mpc_soc_drift
         self.sys_config.mpc_demand_spike_threshold = _mpc_demand_spike
@@ -212,6 +225,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self._state_cache = {
             "actual_power_limit_ID": self.grid_import_limit_w,
             "actual_carbon_intensity_ID": 250.0,
+            "actual_carbon_free_pct_ID": 0.0,
             "actual_electricity_price_ID": 50.0,
             "mandated_min_power_draw_ID": 0.0,
             "available_max_power": 0.0
@@ -219,7 +233,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
 
     # ── Background thread helpers ─────────────────────────────────────────────
 
-    def _run_day_ahead_lp(self, simulation_time: datetime, esdl_id: str, raw_limit: list[float], raw_ci: list[float], raw_price: list[float], raw_demand: list[float], raw_pv: list[float]) -> None:
+    def _run_day_ahead_lp(self, simulation_time: datetime, esdl_id: str, raw_limit: list[float], raw_ci: list[float], raw_cfe: list[float], raw_price: list[float], raw_demand: list[float], raw_pv: list[float]) -> None:
         try:
             if raw_limit:
                 LOGGER.info("[DA thread] Received power_limit_plan_DA VECTOR")
@@ -263,12 +277,24 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             if len(price_actual) != n:
                 price_actual = (price_actual + [price_actual[-1]] * n)[:n]
 
+            # Grid carbon-free share, forecast as a fraction in [0, 1]. The grid
+            # mix is exogenous, so no forecast-error perturbation is applied (we
+            # only perturb the quantities the controller cannot observe ahead of
+            # time). Default 0.0 when the signal is absent → the CFE constraint
+            # (if enabled) would simply forbid all grid draw, surfacing the
+            # missing data rather than silently treating it as fully green.
+            cfe_pct = self._parse_vector(raw_cfe, 0.0, divide_by_1000=False)
+            if len(cfe_pct) != n:
+                cfe_pct = (cfe_pct + [cfe_pct[-1]] * n)[:n] if cfe_pct else [0.0] * n
+            green_frac = [max(0.0, min(1.0, v / 100.0)) for v in cfe_pct]
+
             forecast = {
                 "CI_grid":        self._forecast_error.perturb("CI_grid",  pd.Series(ci_actual)),
                 "grid_available": pd.Series([(v > 0) for v in grid_limits_kw]),
                 "p_DC":           self._forecast_error.perturb("p_DC",     pd.Series(dc_demand_actual)),
                 "p_PV":           pd.Series(pv_actual),
                 "price_E":        self._forecast_error.perturb("price_E", pd.Series(price_actual)),
+                "green_frac":     pd.Series(green_frac),
             }
 
             LOGGER.info(
@@ -290,7 +316,8 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                     grid_available=forecast["grid_available"],
                     p_DC=forecast["p_DC"],
                     p_PV=forecast["p_PV"],
-                    price_E=forecast["price_E"]
+                    price_E=forecast["price_E"],
+                    green_frac=forecast["green_frac"],
                 )
                 flat_p_ch_b = pd.Series([0.0] * n, index=forecast["CI_grid"].index)
                 target_soc = 0.0 if self.sys_config.E_BAT == 0.0 else self.current_soc
@@ -367,6 +394,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         
         raw_limit = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "power_limit_plan_DA")
         raw_ci = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "carbon_intensity_plan_DA")
+        raw_cfe = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "carbon_free_plan_DA")
         raw_price = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "electricity_price_plan_DA")
         raw_demand = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "demand_power_plan_da")
         raw_pv = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "planned_generation_DA")
@@ -374,7 +402,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         LOGGER.info(f"[{simulation_time}] Dispatching day-ahead LP thread.")
         threading.Thread(
             target=self._run_day_ahead_lp,
-            args=(simulation_time, esdl_id, raw_limit, raw_ci, raw_price, raw_demand, raw_pv),
+            args=(simulation_time, esdl_id, raw_limit, raw_ci, raw_cfe, raw_price, raw_demand, raw_pv),
             daemon=True
         ).start()
         
@@ -421,6 +449,10 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         ci_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "actual_carbon_intensity_ID")
         if ci_val is not None:
             self._state_cache["actual_carbon_intensity_ID"] = ci_val
+
+        cfe_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "actual_carbon_free_pct_ID")
+        if cfe_val is not None:
+            self._state_cache["actual_carbon_free_pct_ID"] = cfe_val
 
         price_val = CalculationServiceHelperFunctions.get_single_param_with_name(param_dict, "actual_electricity_price_ID")
         if price_val is not None:
@@ -523,7 +555,8 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
             Price_grid=price_now,
             Price_battery_prev=self.current_price_battery,
             p_PV=pv_kw,
-            p_grid_limit_kw=(limit_w / 1000.0)
+            p_grid_limit_kw=(limit_w / 1000.0),
+            grid_cfe_frac=self._state_cache.get("actual_carbon_free_pct_ID", 0.0) / 100.0,
         )
 
         self.current_day_step_idx += 1
@@ -574,6 +607,7 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
         self.influx_connector.set_time_step_data_point(esdl_id, "Setpoint_from_Layers_kW", simulation_time, setpoint_kw)
         self.influx_connector.set_time_step_data_point(esdl_id, "Grid_Available", simulation_time, 1.0 if grid_available else 0.0)
         self.influx_connector.set_time_step_data_point(esdl_id, "Carbon_Intensity", simulation_time, ci_val)
+        self.influx_connector.set_time_step_data_point(esdl_id, "Carbon_Free_Pct", simulation_time, self._state_cache.get("actual_carbon_free_pct_ID", 0.0))
         self.influx_connector.set_time_step_data_point(esdl_id, "Electricity_Price_EUR_per_MWh", simulation_time, price_now)
         self.influx_connector.set_time_step_data_point(esdl_id, "Step_Cost_EUR", simulation_time, exec_state.cost)
         self.influx_connector.set_time_step_data_point(esdl_id, "Routed_to_Grid_W", simulation_time, grid_w)
@@ -809,6 +843,10 @@ class Networkbalancerservice(NetworkbalancerserviceBase):
                                 self.sys_config.w_soc_low = float(kpi.value)
                             elif kpi.name == "soc_baseline":
                                 self.sys_config.soc_baseline = float(kpi.value)
+                            elif kpi.name == "cfe_constraint_mode":
+                                self.sys_config.cfe_constraint_mode = float(kpi.value)
+                            elif kpi.name == "cfe_min_fraction":
+                                self.sys_config.cfe_min_fraction = float(kpi.value)
                             elif kpi.name == "backup_co2_factor":
                                 self.sys_config.backup_co2_factor = float(kpi.value)
                             elif kpi.name == "backup_cost_eur_per_kwh":

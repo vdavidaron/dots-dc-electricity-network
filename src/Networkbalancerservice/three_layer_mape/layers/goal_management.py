@@ -40,6 +40,15 @@ class SystemConfig:
     w_soc_low: float = 1e6
     soc_baseline: float = 50.0  # Soft SOC target [%]
 
+    # Carbon-free-energy (CFE) grid-draw constraint (uses Goals.green_frac):
+    #   0 = off, 1 = blended (horizon-mean grid CFE >= cfe_min_fraction),
+    #   2 = block (no grid draw on steps with green_frac < cfe_min_fraction).
+    # Modelled as a constraint rather than a 4th objective term: CFE is strongly
+    # anti-correlated with carbon intensity, so a weight would largely duplicate
+    # w_carbon. cfe_min_fraction is a fraction in [0, 1] (1.0 = 100% green grid).
+    cfe_constraint_mode: float = 0.0
+    cfe_min_fraction: float = 0.0
+
     # Backup generator (Scope-1) accounting — read from ESDL KPIs.
     backup_co2_factor: float = 600.0        # [gCO2/kWh] diesel combustion emission factor
     backup_cost_eur_per_kwh: float = 0.40   # [EUR/kWh] diesel fuel cost
@@ -76,6 +85,7 @@ class Goals:
     p_DC:           pd.Series       # 24h DC load forecast  [kW]
     p_PV:           Optional[pd.Series] = None # 24h PV forecast [kW]
     price_E:        Optional[pd.Series] = None # 24h day-ahead price [EUR/MWh]
+    green_frac:     Optional[pd.Series] = None # 24h grid carbon-free share [fraction 0..1]
 
 
 @dataclass
@@ -121,6 +131,7 @@ class GoalManagementLayer:
         p_DC           = forecast["p_DC"]
         p_PV           = forecast.get("p_PV", pd.Series([0.0]*len(p_DC), index=p_DC.index))
         price_E        = forecast.get("price_E", pd.Series([0.0]*len(p_DC), index=p_DC.index))
+        green_frac     = forecast.get("green_frac", None)
 
         outage_hours  = int((~grid_available).sum())
         energy_needed = max(0, (p_DC - p_PV).mean()) * outage_hours          # kWh
@@ -146,6 +157,7 @@ class GoalManagementLayer:
             p_DC=p_DC,
             p_PV=p_PV,
             price_E=price_E,
+            green_frac=green_frac,
         )
         self._knowledge["goals"] = goals
         print(f"[GoalMgmt | Analyze] SOC_target={soc_target:.1f}%")
@@ -170,6 +182,19 @@ class GoalManagementLayer:
         soc     = [pulp.LpVariable(f"soc_{t}",     lowBound=sys_config.SOC_MIN, upBound=sys_config.SOC_MAX) for t in range(n)]
         unserved= [pulp.LpVariable(f"unserved_{t}", lowBound=0) for t in range(n)]
         soc_slack = [pulp.LpVariable(f"soc_slack_{t}", lowBound=0) for t in range(n)]
+        # PV curtailment per step, bounded by available PV. Lets the grid balance be
+        # an equality (below) so p_grid equals the TRUE physical draw: excess PV is
+        # absorbed by pv_curt rather than by letting p_grid float above consumption.
+        # Without this, the energy balance was a `>=` and p_grid could be inflated
+        # in high-carbon-free hours to satisfy the CFE constraint with phantom draw
+        # that never served load or charged the battery.
+        pv_curt = [
+            pulp.LpVariable(
+                f"pv_curt_{t}", lowBound=0,
+                upBound=(float(goals.p_PV.iloc[t]) if goals.p_PV is not None else 0.0),
+            )
+            for t in range(n)
+        ]
 
         # ── Objective ─────────────────────────────────────────────────────────
         # Priority 1: Minimise unserved load (Reliability)
@@ -182,6 +207,25 @@ class GoalManagementLayer:
         w_price    = getattr(sys_config, "w_price", 0.0)
         w_effort   = sys_config.w_effort
         w_soc_low  = sys_config.w_soc_low
+
+        # ── Carbon-free-energy (CFE) grid-draw constraint setup ───────────────
+        # green_frac[t] is the grid's carbon-free share at step t (fraction 0..1).
+        cfe_mode = float(getattr(sys_config, "cfe_constraint_mode", 0.0))
+        cfe_thr  = float(getattr(sys_config, "cfe_min_fraction", 0.0))
+        green = goals.green_frac if goals.green_frac is not None else None
+        cfe_active = green is not None and cfe_mode > 0 and cfe_thr > 0.0
+        # Soft slack on the blended floor: when storage physically cannot reach the
+        # floor, the LP falls short at a heavy penalty rather than going infeasible
+        # and discarding the whole schedule. w_cfe is large, so the floor is
+        # honoured whenever it is achievable and the LP otherwise gets as close as
+        # the battery allows while still carbon-optimising the remainder.
+        w_cfe = 1e6
+        cfe_slack = pulp.LpVariable("cfe_slack", lowBound=0)
+        if cfe_active:
+            LOGGER.info(
+                f"[GoalMgmt | Plan]    CFE constraint mode={int(cfe_mode)} "
+                f"threshold={cfe_thr:.2f} (grid mean CFE={float(green.mean()):.2f})"
+            )
 
         price = goals.price_E if goals.price_E is not None else pd.Series([0.0] * n, index=T)
 
@@ -223,6 +267,7 @@ class GoalManagementLayer:
                 for t in range(n)
             )
             + w_effort * pulp.lpSum(p_ch[t] + p_dch[t] for t in range(n))
+            + w_cfe * cfe_slack
             - (shadow_carbon + shadow_price) * soc[n - 1]
         )
 
@@ -231,6 +276,9 @@ class GoalManagementLayer:
             avail  = bool(goals.grid_available.iloc[t])
             p_dc_t = goals.p_DC.iloc[t]
             p_pv_t = goals.p_PV.iloc[t] if goals.p_PV is not None else 0.0
+            green_t = float(green.iloc[t]) if cfe_active else 1.0
+            # Block mode: this step's grid is too "dirty" to draw from at all.
+            block_dirty = cfe_active and cfe_mode == 2 and green_t < cfe_thr
 
             # SOC dynamics
             if t == 0:
@@ -252,11 +300,23 @@ class GoalManagementLayer:
             if sys_config.E_BAT > 0.0:
                 prob += soc[t] + soc_slack[t] >= sys_config.soc_baseline
 
-            # Grid limits and balance
-            # p_grid_t must satisfy the energy balance (allow PV curtailment if p_grid_t >= 0 and RHS < 0)
-            prob += p_grid[t] >= p_dc_t - p_pv_t + p_ch[t] - p_dch[t] - unserved[t]
+            # Grid energy balance (equality): grid import equals exactly what the
+            # node consumes — load (less unserved) plus charging, minus discharge
+            # and the PV actually used (p_pv - pv_curt). Pinning p_grid to physical
+            # draw is what makes the CFE constraint meaningful: the LP can no longer
+            # satisfy a carbon-free floor by inflating p_grid with phantom energy.
+            prob += p_grid[t] == p_dc_t - (p_pv_t - pv_curt[t]) + p_ch[t] - p_dch[t] - unserved[t]
 
             if not avail:
+                prob += p_grid[t] == 0
+            elif block_dirty:
+                # Grid available but too dirty under block mode: forbid grid draw
+                # so the step is served from PV + battery only. Unserved is NOT
+                # pinned here — if storage cannot cover the gap it shows up as
+                # unserved load (heavily penalised by w_unserved) rather than
+                # making the LP infeasible. This is exactly the signal the
+                # battery-sizing-for-green-operation study needs: an undersized
+                # battery manifests as residual unserved energy.
                 prob += p_grid[t] == 0
             else:
                 # When the grid is forecast-available, demand satisfaction is by
@@ -268,6 +328,16 @@ class GoalManagementLayer:
                 # branch), where w_unserved governs how much reserve to plan.
                 prob += unserved[t] == 0
 
+
+        # Blended CFE constraint: the energy-weighted carbon-free share of grid
+        # imports over the whole horizon must be >= cfe_thr. Linearised from
+        #   Σ(green_t·p_grid_t·dt) / Σ(p_grid_t·dt) >= cfe_thr
+        # to the equivalent linear form Σ((green_t − cfe_thr)·p_grid_t·dt) >= 0.
+        # (No grid draw → 0 >= 0, trivially satisfied.)
+        if cfe_active and cfe_mode == 1:
+            prob += pulp.lpSum(
+                (float(green.iloc[t]) - cfe_thr) * p_grid[t] * dt for t in range(n)
+            ) + cfe_slack >= 0
 
         # End-of-day SOC target (soft: within ±10%)
         prob += soc[n - 1] >= goals.SOC_target_end - 10.0

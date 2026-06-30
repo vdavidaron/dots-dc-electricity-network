@@ -50,7 +50,7 @@ lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="forecast_s
 lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="forecast_sigma_price", value=0.15))
 lv_network.KPIs.kpi.append(esdl.DoubleKPI(id=str(uuid.uuid4()), name="forecast_seed", value=42.0))
 
-# SERVICE 1: DatacenterDemandService - Realistic 4MW load
+# SERVICE 1: DatacenterDemandService - ~1 MW average load (4 MW nameplate ceiling)
 # power is typically EDouble but minLoad is EInt in some ESDL versions
 datacenter = esdl.ElectricityDemand(id=str(uuid.uuid4()), name="Datacenter Load", power=4000000.0)
 datacenter.powerFactor = 0.95
